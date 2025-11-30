@@ -1,7 +1,3 @@
 [submodule "dust3r"]
 	path = dust3r
 	url = https://github.com/naver/dust3r
-
-[submodule "fast3r"]
-	path = fast3r
-	url = https://github.com/facebookresearch/fast3r

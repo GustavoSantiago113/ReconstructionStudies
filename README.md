@@ -18,3 +18,13 @@ pip install -r requirements.txt
 	path = dust3r
 	url = https://github.com/naver/dust3r
 ```
+
+## VGG-T
+
+### Instalation
+
+```bash
+git clone https://github.com/facebookresearch/vggt.git
+cd vggt
+pip install -r requirements.txt
+```

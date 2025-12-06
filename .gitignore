@@ -1,3 +1,5 @@
 images_train/
 models/
-reconstructions/
+reconstructions/*
+!reconstructions/vggt_10_False.ply
+!reconstructions/dust3r_4_True.ply

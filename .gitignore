@@ -3,3 +3,6 @@ models/
 reconstructions/*
 !reconstructions/vggt_10_False.ply
 !reconstructions/dust3r_4_True.ply
+!reconstructions/colmap_20_False.ply
+frames/
+360_video.mp4

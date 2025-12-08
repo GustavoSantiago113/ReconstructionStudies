@@ -5,3 +5,7 @@
 [submodule "vggt"]
 	path = vggt
 	url = https://github.com/facebookresearch/vggt
+
+[submodule "ffmpeg"]
+	path = ffmpeg
+	url = https://github.com/FFmpeg/FFmpeg

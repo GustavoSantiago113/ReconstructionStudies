@@ -78,9 +78,6 @@ def clean_point_cloud(pcd_or_path, method='statistical', nb_neighbors=20, std_ra
         pcd_clean, ind = pcd.remove_radius_outlier(nb_points=min_points, radius=radius)
         if isinstance(pcd_clean, tuple):
             pcd_clean = pcd.select_by_index(pcd_clean[1])
-    elif method == 'vfps':
-        # Already handled above
-        pass
     else:
         raise ValueError('Unknown method: ' + str(method))
 
@@ -100,3 +97,22 @@ def visualize_point_cloud(pcd_or_path, window_name='Point Cloud'):
         pcd = pcd_or_path
     # Use the simple blocking visualizer; interactive GUI will open
     o3d.visualization.draw_geometries([pcd], window_name=window_name)
+
+def remove_outliers(pc, eps=0.02, min_points=10):
+    """
+    Remove outliers by clustering and keeping only the largest cluster.
+    
+    Returns an Open3D PointCloud containing only the largest DBSCAN cluster.
+    If no clusters are found, returns an empty Open3D PointCloud.
+    """
+    labels = np.array(pc.cluster_dbscan(eps=eps, min_points=min_points))
+
+    # If clustering failed or no valid cluster labels, return an empty point cloud
+    if len(labels) == 0 or (labels >= 0).sum() == 0:
+        return o3d.geometry.PointCloud()
+
+    # Find the largest cluster label (exclude noise: label < 0)
+    largest_cluster = np.argmax(np.bincount(labels[labels >= 0]))
+    mask_cluster = labels == largest_cluster
+    cleaned_pc = pc.select_by_index(np.where(mask_cluster)[0])
+    return cleaned_pc

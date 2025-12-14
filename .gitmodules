@@ -6,6 +6,6 @@
 	path = vggt
 	url = https://github.com/facebookresearch/vggt
 
-[submodule "ffmpeg"]
-	path = ffmpeg
-	url = https://github.com/FFmpeg/FFmpeg
+[submodule "Depth-Anything-3"]
+	path = Depth-Anything-3
+	url = https://github.com/ByteDance-Seed/Depth-Anything-3

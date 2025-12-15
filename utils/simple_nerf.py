@@ -183,7 +183,8 @@ class SimpleNeRF(nn.Module):
         
         # Get features and density
         features = self.density_net(pos_enc)
-        density = F.relu(features[..., :1])
+        # Use softplus for density (allows gradients to flow, standard in NeRF)
+        density = F.softplus(features[..., :1] - 1.0)  # -1 bias for initialization
         feature_vec = features[..., 1:]
         
         # Encode directions
@@ -217,6 +218,19 @@ class SimpleNeRFTrainer:
         # Initialize model
         self.model = SimpleNeRF().to(self.device)
         
+        # Scene normalization (world -> [-1, 1])
+        cam_centers = self.poses[:, :3, 3]
+        self.scene_center = cam_centers.mean(dim=0)
+        distances = (cam_centers - self.scene_center).norm(dim=1)
+        self.scene_radius = distances.max() * 2.0  # Give more room
+        self.scene_radius = torch.clamp(self.scene_radius, min=1.0)
+        print(f"Scene center: {self.scene_center.cpu().numpy()}, radius: {float(self.scene_radius):.3f}")
+        print(f"Camera distance range: {distances.min():.3f} to {distances.max():.3f}")
+    
+    def normalize_positions(self, pts: torch.Tensor) -> torch.Tensor:
+        """Map world-space positions to [-1, 1] using scene_center/radius."""
+        return torch.clamp((pts - self.scene_center) / self.scene_radius, -1.0, 1.0)
+        
     def load_data(self):
         """Load images and camera poses"""
         transforms_file = self.data_dir / "transforms.json"
@@ -226,16 +240,13 @@ class SimpleNeRFTrainer:
         
         self.images = []
         self.poses = []
-        
         print("Loading images and poses...")
         for frame in transforms['frames']:
             img_path = self.data_dir / frame['file_path'].lstrip('./')
             
             if img_path.exists():
                 img = Image.open(img_path)
-                
                 img = img.convert('RGB')
-                
                 img = np.array(img) / 255.0
                 self.images.append(img)
                 
@@ -245,18 +256,37 @@ class SimpleNeRFTrainer:
         self.images = torch.FloatTensor(np.stack(self.images)).to(self.device)
         self.poses = torch.FloatTensor(np.stack(self.poses)).to(self.device)
         
-        # Camera intrinsics
-        self.focal = transforms.get('fl_x', 500.0)
-        self.cx = transforms.get('cx', transforms.get('w', 512) / 2)
-        self.cy = transforms.get('cy', transforms.get('h', 512) / 2)
-        self.img_h = transforms.get('h', 512)
-        self.img_w = transforms.get('w', 512)
+        # Use actual image size from loaded data (already resized during preprocessing)
+        self.img_h, self.img_w = self.images.shape[1], self.images.shape[2]
+        
+        # Camera intrinsics (should already be scaled for the resized images)
+        self.fx = float(transforms.get('fl_x', transforms.get('fx', max(self.img_w, 1))))
+        self.fy = float(transforms.get('fl_y', transforms.get('fy', self.fx)))
+        self.cx = float(transforms.get('cx', self.img_w / 2))
+        self.cy = float(transforms.get('cy', self.img_h / 2))
         
         print(f"Loaded {len(self.images)} images")
         print(f"Image size: {self.img_h}x{self.img_w}")
+        print(f"Intrinsics: fx={self.fx:.1f}, fy={self.fy:.1f}, cx={self.cx:.1f}, cy={self.cy:.1f}")
     
-    def get_rays(self, pose, H, W, focal):
-        """Generate camera rays"""
+    def debug_network_output(self, n_samples: int = 1000):
+        """Debug method to check if network produces non-zero outputs"""
+        print("\\nDebugging network output...")
+        # Sample random positions in normalized space
+        pos = torch.randn(n_samples, 3, device=self.device) * 0.5  # Within [-1, 1] roughly
+        dirs = torch.randn(n_samples, 3, device=self.device)
+        dirs = dirs / dirs.norm(dim=-1, keepdim=True)  # Normalize directions
+        
+        with torch.no_grad():
+            colors, densities = self.model(pos, dirs)
+            sigma = densities.squeeze()  # Already softplus activated
+            
+        print(f"  Colors range: [{colors.min():.4f}, {colors.max():.4f}]")
+        print(f"  Densities (sigma) range: [{sigma.min():.4f}, {sigma.max():.4f}]")
+        print(f"  Non-zero densities: {(sigma > 1e-4).sum().item()}/{n_samples}")
+    
+    def get_rays(self, pose, H, W):
+        """Generate camera rays using fx, fy, cx, cy."""
         i, j = torch.meshgrid(
             torch.arange(W, dtype=torch.float32, device=self.device),
             torch.arange(H, dtype=torch.float32, device=self.device),
@@ -264,8 +294,8 @@ class SimpleNeRFTrainer:
         )
         
         dirs = torch.stack([
-            (i - W/2) / focal,
-            -(j - H/2) / focal,
+            (i - self.cx) / self.fx,
+            -(j - self.cy) / self.fy,
             -torch.ones_like(i)
         ], dim=-1)
         
@@ -277,7 +307,7 @@ class SimpleNeRFTrainer:
         
         return rays_o, rays_d
     
-    def render_rays(self, rays_o, rays_d, near=0.5, far=6.0, n_samples=64):
+    def render_rays(self, rays_o, rays_d, near=0.2, far=8.0, n_samples=64):
         """Volume rendering along rays"""
         # Sample points along rays
         t_vals = torch.linspace(0, 1, n_samples, device=self.device)
@@ -287,13 +317,15 @@ class SimpleNeRFTrainer:
         # Get sample points
         pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]
         pts_flat = pts.reshape(-1, 3)
+        # Normalize to hash grid domain [-1, 1]
+        pts_flat_norm = self.normalize_positions(pts_flat)
         
         # Get directions
         dirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
         dirs_flat = dirs[:, None, :].expand_as(pts).reshape(-1, 3)
         
         # Query network
-        colors, densities = self.model(pts_flat, dirs_flat)
+        colors, densities = self.model(pts_flat_norm, dirs_flat)
         
         colors = colors.reshape(*pts.shape[:-1], 3)
         densities = densities.reshape(*pts.shape[:-1])
@@ -302,7 +334,9 @@ class SimpleNeRFTrainer:
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         dists = torch.cat([dists, torch.ones_like(dists[..., :1]) * 1e10], dim=-1)
         
-        alpha = 1.0 - torch.exp(-F.relu(densities) * dists)
+        # Densities are already processed by softplus in the model
+        sigma = densities.squeeze(-1)
+        alpha = 1.0 - torch.exp(-sigma * dists)
         weights = alpha * torch.cumprod(
             torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1),
             dim=-1
@@ -311,8 +345,52 @@ class SimpleNeRFTrainer:
         rgb = torch.sum(weights[..., None] * colors, dim=-2)
         
         return rgb, weights, z_vals
+
+    def render_image(self, img_idx: int = 0, near: float = 0.2, far: float = 8.0, n_samples: int = 64, chunk: int = 8192):
+        pose = self.poses[img_idx]
+        H, W = self.img_h, self.img_w
+        rays_o, rays_d = self.get_rays(pose, H, W)
+        rays_o = rays_o.reshape(-1, 3)
+        rays_d = rays_d.reshape(-1, 3)
+        all_rgb = []
+        all_depth = []
+        with torch.no_grad():
+            for i in range(0, rays_o.shape[0], chunk):
+                ro = rays_o[i:i+chunk]
+                rd = rays_d[i:i+chunk]
+                rgb, weights, z_vals = self.render_rays(ro, rd, near=near, far=far, n_samples=n_samples)
+                if weights is not None and z_vals is not None:
+                    depth = (weights * z_vals).sum(dim=-1)
+                else:
+                    depth = torch.zeros(rgb.shape[0], device=rgb.device)
+                all_rgb.append(rgb)
+                all_depth.append(depth)
+        rgb = torch.cat(all_rgb, dim=0).reshape(H, W, 3).clamp(0, 1).cpu().numpy()
+        depth = torch.cat(all_depth, dim=0).reshape(H, W).cpu().numpy()
+        return rgb, depth
+
+    def save_preview(self, img_idx: int = 0, near: float = 0.2, far: float = 8.0, n_samples: int = 64, prefix: str = "preview"):
+        rgb, depth = self.render_image(img_idx, near=near, far=far, n_samples=n_samples)
+        
+        # Debug prints
+        print(f"  RGB range: [{rgb.min():.4f}, {rgb.max():.4f}]")
+        print(f"  Depth range: [{depth.min():.4f}, {depth.max():.4f}]")
+        
+        rgb_img = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+        
+        # Normalize depth for visualization
+        d = depth.copy()
+        if d.max() > 0:
+            d_norm = d / d.max()  # Normalize to [0,1]
+        else:
+            d_norm = np.zeros_like(d)
+        d_img = (d_norm * 255).astype(np.uint8)
+        
+        Image.fromarray(rgb_img).save(self.output_dir / f"{prefix}_rgb_{img_idx:03d}.png")
+        Image.fromarray(d_img).save(self.output_dir / f"{prefix}_depth_{img_idx:03d}.png")
+        print(f"  Saved preview: {prefix}_rgb_{img_idx:03d}.png, {prefix}_depth_{img_idx:03d}.png")
     
-    def train(self, n_iters: int = 10000, batch_size: int = 1024, lr: float = 5e-4):
+    def train(self, n_iters: int = 10000, batch_size: int = 1024, lr: float = 5e-4, preview_every: int = 0, preview_index: int = 0):
         """Train the NeRF model, saving only the best model (lowest loss)."""
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         print(f"\nTraining for {n_iters} iterations...")
@@ -325,7 +403,7 @@ class SimpleNeRFTrainer:
             img = self.images[img_idx]  # Already on device
             pose = self.poses[img_idx]  # Already on device
             # Get rays
-            rays_o, rays_d = self.get_rays(pose, self.img_h, self.img_w, self.focal)
+            rays_o, rays_d = self.get_rays(pose, self.img_h, self.img_w)
             rays_o = rays_o.reshape(-1, 3)
             rays_d = rays_d.reshape(-1, 3)
             # Random ray batch
@@ -344,6 +422,10 @@ class SimpleNeRFTrainer:
             # Log
             if (i + 1) % 100 == 0:
                 print(f"Iteration {i+1}/{n_iters}, Loss: {loss.item():.6f}")
+            if preview_every > 0 and (i + 1) % preview_every == 0:
+                print("Rendering preview (RGB + depth)...")
+                self.debug_network_output()  # Debug network before rendering
+                self.save_preview(preview_index, prefix=f"iter_{i+1}")
             # Track best model
             if loss.item() < best_loss:
                 best_loss = loss.item()
@@ -372,8 +454,8 @@ class SimpleNeRFTrainer:
         }, checkpoint_path)
         print(f"  Saved checkpoint: {checkpoint_path}")
     
-    def extract_mesh(self, resolution: int = 128, threshold: float = 50.0):
-        """Extract mesh using marching cubes"""
+    def extract_mesh(self, resolution: int = 128, threshold: Optional[float] = None):
+        """Extract mesh using marching cubes over opacity in normalized space."""
         try:
             from skimage import measure
             import trimesh
@@ -381,10 +463,10 @@ class SimpleNeRFTrainer:
             print("\u2717 Please install: pip install scikit-image trimesh")
             return None
         
-        print(f"\\nExtracting mesh (resolution: {resolution})...")
+        print(f"\nExtracting mesh (resolution: {resolution})...")
         
-        # Create grid
-        bound = 2.0
+        # Create grid in normalized coordinates [-1, 1]
+        bound = 1.0
         x = torch.linspace(-bound, bound, resolution, device=self.device)
         y = torch.linspace(-bound, bound, resolution, device=self.device)
         z = torch.linspace(-bound, bound, resolution, device=self.device)
@@ -395,41 +477,51 @@ class SimpleNeRFTrainer:
         # Dummy directions (not used for density)
         directions = torch.zeros_like(positions)
         
-        # Query density in batches
+        # Query opacity in batches (convert sigma -> alpha using grid step)
         batch_size = 10000
-        densities = []
+        alphas = []
         
         self.model.eval()
         with torch.no_grad():
             for i in range(0, len(positions), batch_size):
                 batch_pos = positions[i:i+batch_size]
                 batch_dir = directions[i:i+batch_size]
-                _, density = self.model(batch_pos, batch_dir)
-                densities.append(density.cpu())
+                # Positions already in normalized space
+                _, sigma = self.model(batch_pos, batch_dir)
+                # Step size in world coordinates for proper opacity calculation
+                dt = (2.0 * float(self.scene_radius)) / resolution
+                # Sigma is already activated by softplus in the model
+                alpha = 1.0 - torch.exp(-sigma.squeeze(-1) * dt)
+                alphas.append(alpha.cpu())
         
-        densities = torch.cat(densities, dim=0)
-        density_grid = densities.reshape(resolution, resolution, resolution).numpy()
+        alpha = torch.cat(alphas, dim=0)
+        alpha_grid = alpha.reshape(resolution, resolution, resolution).numpy()
         
-        # Density diagnostics
-        print(f"  Density range: [{density_grid.min():.4f}, {density_grid.max():.4f}]")
-        print(f"  Density mean: {density_grid.mean():.4f}, std: {density_grid.std():.4f}")
+        # Opacity diagnostics
+        print(f"  Opacity range: [{alpha_grid.min():.4f}, {alpha_grid.max():.4f}]")
+        print(f"  Opacity mean: {alpha_grid.mean():.4f}, std: {alpha_grid.std():.4f}")
         
-        # Adjust threshold if needed
-        if density_grid.max() < threshold:
-            threshold = density_grid.mean() + 0.5 * density_grid.std()
-            print(f"  Adjusted threshold to {threshold:.4f} (original {10.0:.1f} was too high)")
+        # Adaptive threshold if not provided (use 50th percentile of non-zero values)
+        if threshold is None:
+            non_zero = alpha_grid[alpha_grid > 1e-6]
+            if len(non_zero) > 0:
+                threshold = float(np.percentile(non_zero, 50))
+            else:
+                threshold = 1e-4
+        threshold = float(np.clip(threshold, 1e-6, 0.9))
+        print(f"  Using opacity threshold: {threshold:.6f}")
         
         # Marching cubes
         print("  Running marching cubes...")
         try:
             verts, faces, normals, values = measure.marching_cubes(
-                density_grid,
+                alpha_grid,
                 level=threshold,
                 spacing=(2*bound/resolution, 2*bound/resolution, 2*bound/resolution)
             )
             
-            # Offset vertices
-            verts = verts - bound
+            # Convert from normalized to world coordinates
+            verts = (verts - bound) * float(self.scene_radius.cpu()) + self.scene_center.cpu().numpy()
             
             # Create mesh
             mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
@@ -455,27 +547,34 @@ class SimpleNeRFTrainer:
         
         print(f"\\nExtracting point cloud ({num_points} points)...")
         
-        # Sample random points in space
-        bound = 2.0
-        positions = torch.FloatTensor(num_points, 3).uniform_(-bound, bound).to(self.device)
-        directions = torch.zeros_like(positions)
+        # Sample random points in normalized space
+        bound = 1.0
+        positions_norm = torch.FloatTensor(num_points, 3).uniform_(-bound, bound).to(self.device)
+        directions = torch.zeros_like(positions_norm)
         
-        # Query density
+        # Query colors and alpha
         self.model.eval()
         with torch.no_grad():
-            colors, densities = self.model(positions, directions)
+            colors, sigma = self.model(positions_norm, directions)
+        # Use proper step size in world coordinates
+        dt = (2.0 * float(self.scene_radius)) / 128
+        alpha = 1.0 - torch.exp(-sigma.squeeze(-1) * dt)
+        alpha_np = alpha.cpu().numpy()
+        print(f"  Alpha range: [{alpha_np.min():.4f}, {alpha_np.max():.4f}]")
+        print(f"  Alpha mean: {alpha_np.mean():.4f}, std: {alpha_np.std():.4f}")
         
-        densities_np = densities.squeeze().cpu().numpy()
-        print(f"  Density range: [{densities_np.min():.4f}, {densities_np.max():.4f}]")
-        print(f"  Density mean: {densities_np.mean():.4f}, std: {densities_np.std():.4f}")
+        # Adaptive alpha threshold (median of non-zero values)
+        non_zero = alpha_np[alpha_np > 1e-6]
+        if len(non_zero) > 0:
+            threshold = float(np.percentile(non_zero, 50))
+        else:
+            threshold = 1e-6
+        print(f"  Using adaptive alpha threshold: {threshold:.6f}")
         
-        # Adaptive threshold based on actual density distribution
-        threshold = densities_np.mean() + 0.5 * densities_np.std()
-        print(f"  Using adaptive threshold: {threshold:.4f}")
+        mask = alpha > threshold
         
-        mask = densities.squeeze() > threshold
-        
-        points = positions[mask].cpu().numpy()
+        # Un-normalize to world coordinates
+        points = (positions_norm[mask] * self.scene_radius + self.scene_center).cpu().numpy()
         colors = (colors[mask].cpu().numpy() * 255).astype(np.uint8)
         
         print(f"  Filtered to {len(points)} points above threshold")
@@ -494,7 +593,9 @@ class SimpleNeRFTrainer:
 def train_simple_nerf(data_dir: str, output_dir: str, 
                      n_iters: int = 10000,
                      mesh_resolution: int = 128,
-                     num_points: int = 100000):
+                     num_points: int = 100000,
+                     preview_every: int = 0,
+                     preview_index: int = 0):
     """
     Convenience function to train Instant NGP and extract outputs.
     
@@ -511,7 +612,7 @@ def train_simple_nerf(data_dir: str, output_dir: str,
     
     # Train
     trainer = SimpleNeRFTrainer(data_dir, output_dir)
-    trainer.train(n_iters=n_iters)
+    trainer.train(n_iters=n_iters, preview_every=preview_every, preview_index=preview_index)
     
     # Extract mesh
     trainer.extract_mesh(resolution=mesh_resolution)
@@ -525,10 +626,32 @@ def train_simple_nerf(data_dir: str, output_dir: str,
 
 
 if __name__ == "__main__":
-    train_simple_nerf(
-        data_dir="../reconstructions/InstantNGP_preprocessed/2_segmentation",
-        output_dir="../reconstructions/InstantNGP_preprocessed/3_reconstruction",
-        n_iters=10000,
-        mesh_resolution=128,
-        num_points=100000
-    )
+    import argparse
+    parser = argparse.ArgumentParser(description="Simple NeRF training and preview rendering")
+    parser.add_argument("--data_dir", type=str, default="../reconstructions/InstantNGP_preprocessed/2_segmentation")
+    parser.add_argument("--output_dir", type=str, default="../reconstructions/InstantNGP_preprocessed/3_reconstruction")
+    parser.add_argument("--n_iters", type=int, default=10000)
+    parser.add_argument("--mesh_resolution", type=int, default=128)
+    parser.add_argument("--num_points", type=int, default=100000)
+    parser.add_argument("--preview_every", type=int, default=0, help="Render RGB/depth previews every N iters (0=disable)")
+    parser.add_argument("--preview_index", type=int, default=0, help="Image index to use for preview rendering")
+    parser.add_argument("--render_preview", action="store_true", help="Render a preview without training")
+    parser.add_argument("--near", type=float, default=0.5)
+    parser.add_argument("--far", type=float, default=6.0)
+    parser.add_argument("--samples", type=int, default=64)
+    args = parser.parse_args()
+
+    if args.render_preview:
+        trainer = SimpleNeRFTrainer(args.data_dir, args.output_dir)
+        print("Rendering preview (RGB + depth)...")
+        trainer.save_preview(args.preview_index, near=args.near, far=args.far, n_samples=args.samples)
+    else:
+        train_simple_nerf(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            n_iters=args.n_iters,
+            mesh_resolution=args.mesh_resolution,
+            num_points=args.num_points,
+            preview_every=args.preview_every,
+            preview_index=args.preview_index,
+        )

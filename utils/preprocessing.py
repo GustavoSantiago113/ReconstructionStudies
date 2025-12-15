@@ -23,7 +23,7 @@ class ImagePreprocessor:
     and filtering images based on viewing direction.
     """
     
-    def __init__(self, images_dir: str, output_dir: str, angle_threshold: float = 20.0, enable_filtering: bool = True):
+    def __init__(self, images_dir: str, output_dir: str, angle_threshold: float = 20.0, enable_filtering: bool = True, max_image_size: int = 512):
         """
         Initialize the preprocessor.
         
@@ -32,11 +32,13 @@ class ImagePreprocessor:
             output_dir: Directory to save filtered images and poses
             angle_threshold: Maximum angle in degrees for IAF filtering (default: 20°)
             enable_filtering: Enable IAF filtering (default: True, set False for 360° captures)
+            max_image_size: Resize images so largest side is this size (default: 512)
         """
         self.images_dir = Path(images_dir)
         self.output_dir = Path(output_dir)
         self.angle_threshold = angle_threshold
         self.enable_filtering = enable_filtering
+        self.max_image_size = max_image_size
         
         # Create output directories
         self.colmap_dir = self.output_dir / "colmap"
@@ -268,6 +270,43 @@ class ImagePreprocessor:
         
         return [qw, qx, qy, qz]
     
+    def resize_image(self, image_path: Path, output_path: Path) -> Tuple[int, int, float]:
+        """
+        Resize image so largest side is max_image_size, maintaining aspect ratio.
+        
+        Args:
+            image_path: Input image path
+            output_path: Output image path
+            
+        Returns:
+            (new_width, new_height, scale_factor)
+        """
+        import cv2
+        
+        # Read image
+        img = cv2.imread(str(image_path))
+        if img is None:
+            raise ValueError(f"Could not read image: {image_path}")
+        
+        h, w = img.shape[:2]
+        
+        # Calculate scale to fit within max_image_size
+        scale = self.max_image_size / max(w, h)
+        
+        if scale >= 1.0:
+            # No resizing needed
+            shutil.copy2(image_path, output_path)
+            return w, h, 1.0
+        
+        # Resize
+        new_w, new_h = int(round(w * scale)), int(round(h * scale))
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # Save
+        cv2.imwrite(str(output_path), resized)
+        
+        return new_w, new_h, scale
+    
     def extract_camera_poses(self) -> Dict[str, Dict]:
         """
         Extract camera poses from COLMAP output.
@@ -477,12 +516,23 @@ class ImagePreprocessor:
         """
         print("Saving filtered data...")
         
-        # Copy filtered images
+        # Resize and copy filtered images
+        image_scales = {}
+        final_sizes = {}
         for image_name in filtered_images:
             src = self.images_dir / image_name
             dst = self.filtered_dir / image_name
             if src.exists():
-                shutil.copy2(src, dst)
+                try:
+                    new_w, new_h, scale = self.resize_image(src, dst)
+                    image_scales[image_name] = scale
+                    final_sizes[image_name] = (new_w, new_h)
+                    if scale < 1.0:
+                        print(f"  Resized {image_name}: scale={scale:.3f}, size={new_w}x{new_h}")
+                except Exception as e:
+                    print(f"  Warning: Could not resize {image_name}: {e}")
+                    shutil.copy2(src, dst)
+                    image_scales[image_name] = 1.0
         
         # Save poses in JSON format
         filtered_poses = {img: poses[img] for img in filtered_images if img in poses}
@@ -503,13 +553,13 @@ class ImagePreprocessor:
             json.dump(filtered_poses, f, indent=2)
         
         # Also save in COLMAP-compatible format for Instant-NGP
-        self._save_transforms_json(filtered_poses)
+        self._save_transforms_json(filtered_poses, image_scales, final_sizes)
         
         print(f"✓ Saved {len(filtered_images)} filtered images")
         print(f"  Images: {self.filtered_dir}")
         print(f"  Poses: {poses_file}")
     
-    def _save_transforms_json(self, poses: Dict[str, Dict]):
+    def _save_transforms_json(self, poses: Dict[str, Dict], image_scales: Dict[str, float], final_sizes: Dict[str, Tuple[int, int]]):
         """
         Save poses in transforms.json format compatible with Instant-NGP.
         """
@@ -517,7 +567,7 @@ class ImagePreprocessor:
         cameras_file = self.colmap_dir / "sparse" / "0" / "cameras.txt"
         
         fx, fy, cx, cy = 500, 500, 256, 256  # Default values
-        w, h = 512, 512
+        w_orig, h_orig = 512, 512
         
         if cameras_file.exists():
             with open(cameras_file, 'r') as f:
@@ -526,9 +576,19 @@ class ImagePreprocessor:
                         continue
                     parts = line.strip().split()
                     if len(parts) >= 8:
-                        w, h = int(parts[2]), int(parts[3])
+                        w_orig, h_orig = int(parts[2]), int(parts[3])
                         fx, fy, cx, cy = map(float, parts[4:8])
                         break
+        
+        # Use actual resized dimensions and scale intrinsics
+        if final_sizes:
+            # Use the size from the first image (all should be similar after resizing)
+            first_img = next(iter(final_sizes.keys()))
+            w, h = final_sizes[first_img]
+            scale = image_scales[first_img]
+            fx, fy, cx, cy = fx * scale, fy * scale, cx * scale, cy * scale
+        else:
+            w, h = w_orig, h_orig
         
         transforms = {
             "camera_angle_x": 2 * np.arctan(w / (2 * fx)),

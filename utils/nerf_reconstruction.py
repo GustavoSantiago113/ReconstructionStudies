@@ -22,9 +22,9 @@ except:
     from simple_nerf import train_simple_nerf
 
 
-class InstantNGPReconstructor:
+class NeRFReconstructor:
     """
-    Handles 3D reconstruction using Instant-NGP (instant-ngp or nerfstudio implementation).
+    Handles 3D reconstruction using a NeRF model.
     """
     
     def __init__(self, 
@@ -54,7 +54,8 @@ class InstantNGPReconstructor:
                                max_iterations: int = 10000,
                                mesh_resolution: int = 128,
                                num_points: int = 100000,
-                               method: str = "simple-nerf") -> bool:
+                               preview_every: int = 1000,
+                               preview_index: int = 0) -> bool:
         """
         Run complete reconstruction pipeline.
         
@@ -79,7 +80,9 @@ class InstantNGPReconstructor:
                 output_dir=str(self.output_dir),
                 n_iters=max_iterations,
                 mesh_resolution=mesh_resolution,
-                num_points=num_points
+                num_points=num_points,
+                preview_every=preview_every,
+                preview_index=preview_index
             )
         except Exception as e:
             print(f"✗ Training failed: {e}")
@@ -171,7 +174,7 @@ class MarchingCubesExtractor:
 
 if __name__ == "__main__":
     # Example usage
-    reconstructor = InstantNGPReconstructor(
+    reconstructor = NeRFReconstructor(
         data_dir="../reconstructions/InstantNGP_preprocessed",
         output_dir="../reconstructions/InstantNGP_output",
     )
@@ -180,5 +183,6 @@ if __name__ == "__main__":
         max_iterations=30000,
         mesh_resolution=1024,
         num_points=1000000,
-        method="instant-ngp"
+        preview_every=1000,
+        preview_index=0
     )

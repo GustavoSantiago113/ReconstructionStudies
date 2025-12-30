@@ -391,48 +391,69 @@ class SimpleNeRFTrainer:
         print(f"  Saved preview: {prefix}_rgb_{img_idx:03d}.png, {prefix}_depth_{img_idx:03d}.png")
     
     def train(self, n_iters: int = 10000, batch_size: int = 1024, lr: float = 5e-4, preview_every: int = 0, preview_index: int = 0):
-        """Train the NeRF model, saving only the best model (lowest loss)."""
+        """Train the NeRF model with background regularization."""
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         print(f"\nTraining for {n_iters} iterations...")
         best_loss = float('inf')
         best_state = None
         best_iter = 0
+        
         for i in range(n_iters):
             # Random image
             img_idx = np.random.randint(0, len(self.images))
-            img = self.images[img_idx]  # Already on device
-            pose = self.poses[img_idx]  # Already on device
+            img = self.images[img_idx]
+            pose = self.poses[img_idx]
+            
             # Get rays
             rays_o, rays_d = self.get_rays(pose, self.img_h, self.img_w)
             rays_o = rays_o.reshape(-1, 3)
             rays_d = rays_d.reshape(-1, 3)
+            
             # Random ray batch
             select_idx = np.random.choice(rays_o.shape[0], batch_size, replace=False)
             rays_o_batch = rays_o[select_idx]
             rays_d_batch = rays_d[select_idx]
             target_rgb = img.reshape(-1, 3)[select_idx]
+            
             # Render
             rgb, weights, z_vals = self.render_rays(rays_o_batch, rays_d_batch)
-            # Compute loss
-            loss = F.mse_loss(rgb, target_rgb)
+            
+            # RGB loss
+            rgb_loss = F.mse_loss(rgb, target_rgb)
+            
+            # Background regularization: penalize density where target is black
+            # This forces the network to learn zero density in transparent/black regions
+            is_background = (target_rgb.sum(dim=-1) < 0.01)  # Nearly black pixels
+            if is_background.any():
+                # For background pixels, we want low total opacity
+                bg_weights = weights[is_background]
+                bg_opacity = bg_weights.sum(dim=-1)  # Total accumulated opacity
+                bg_loss = bg_opacity.mean() * 0.1  # Weight the background loss
+                loss = rgb_loss + bg_loss
+            else:
+                loss = rgb_loss
+            
             # Optimize
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
             # Log
             if (i + 1) % 100 == 0:
                 print(f"Iteration {i+1}/{n_iters}, Loss: {loss.item():.6f}")
+            
             if preview_every > 0 and (i + 1) % preview_every == 0:
                 print("Rendering preview (RGB + depth)...")
-                self.debug_network_output()  # Debug network before rendering
+                self.debug_network_output()
                 self.save_preview(preview_index, prefix=f"iter_{i+1}")
+            
             # Track best model
             if loss.item() < best_loss:
                 best_loss = loss.item()
                 best_state = self.model.state_dict()
                 best_iter = i + 1
-        print(f"\n\u2713 Training completed! Best loss: {best_loss:.6f} at iteration {best_iter}")
-        # Save only the best checkpoint
+        
+        print(f"\n✓ Training completed! Best loss: {best_loss:.6f} at iteration {best_iter}")
         self.save_best_checkpoint(best_state, best_iter, best_loss)
 
     def save_best_checkpoint(self, state_dict, iteration, loss):
@@ -455,12 +476,12 @@ class SimpleNeRFTrainer:
         print(f"  Saved checkpoint: {checkpoint_path}")
     
     def extract_mesh(self, resolution: int = 128, threshold: Optional[float] = None):
-        """Extract mesh using marching cubes over opacity in normalized space."""
+        """Extract mesh using marching cubes with better thresholding."""
         try:
             from skimage import measure
             import trimesh
         except ImportError:
-            print("\u2717 Please install: pip install scikit-image trimesh")
+            print("✗ Please install: pip install scikit-image trimesh")
             return None
         
         print(f"\nExtracting mesh (resolution: {resolution})...")
@@ -474,10 +495,10 @@ class SimpleNeRFTrainer:
         xx, yy, zz = torch.meshgrid(x, y, z, indexing='ij')
         positions = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
         
-        # Dummy directions (not used for density)
+        # Dummy directions
         directions = torch.zeros_like(positions)
         
-        # Query opacity in batches (convert sigma -> alpha using grid step)
+        # Query opacity in batches
         batch_size = 10000
         alphas = []
         
@@ -486,11 +507,8 @@ class SimpleNeRFTrainer:
             for i in range(0, len(positions), batch_size):
                 batch_pos = positions[i:i+batch_size]
                 batch_dir = directions[i:i+batch_size]
-                # Positions already in normalized space
                 _, sigma = self.model(batch_pos, batch_dir)
-                # Step size in world coordinates for proper opacity calculation
                 dt = (2.0 * float(self.scene_radius)) / resolution
-                # Sigma is already activated by softplus in the model
                 alpha = 1.0 - torch.exp(-sigma.squeeze(-1) * dt)
                 alphas.append(alpha.cpu())
         
@@ -501,15 +519,16 @@ class SimpleNeRFTrainer:
         print(f"  Opacity range: [{alpha_grid.min():.4f}, {alpha_grid.max():.4f}]")
         print(f"  Opacity mean: {alpha_grid.mean():.4f}, std: {alpha_grid.std():.4f}")
         
-        # Adaptive threshold if not provided (use 50th percentile of non-zero values)
+        # Much more aggressive threshold - use 90th percentile to get only the solid object
         if threshold is None:
-            non_zero = alpha_grid[alpha_grid > 1e-6]
-            if len(non_zero) > 0:
-                threshold = float(np.percentile(non_zero, 50))
+            non_zero = alpha_grid[alpha_grid > 1e-4]
+            if len(non_zero) > 100:
+                # Use 90th percentile to capture only dense regions
+                threshold = float(np.percentile(non_zero, 90))
             else:
-                threshold = 1e-4
-        threshold = float(np.clip(threshold, 1e-6, 0.9))
-        print(f"  Using opacity threshold: {threshold:.6f}")
+                threshold = 0.05
+        threshold = float(np.clip(threshold, 0.01, 0.99))
+        print(f"  Using opacity threshold: {threshold:.4f}")
         
         # Marching cubes
         print("  Running marching cubes...")
@@ -526,74 +545,52 @@ class SimpleNeRFTrainer:
             # Create mesh
             mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
             
+            # Clean up mesh - remove small disconnected components
+            print("  Cleaning mesh...")
+            components = mesh.split(only_watertight=False)
+            if len(components) > 1:
+                # Keep only the largest component
+                largest = max(components, key=lambda c: len(c.vertices))
+                mesh = largest
+                print(f"  Kept largest component: {len(mesh.vertices)} vertices")
+            
             # Save mesh
             mesh_path = self.output_dir / "mesh.ply"
             mesh.export(mesh_path)
-            print(f"\u2713 Mesh saved: {mesh_path}")
+            print(f"✓ Mesh saved: {mesh_path}")
+            print(f"  Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
+
+            # Export point cloud from mesh vertices
+            try:
+                print("  Generating point cloud from mesh vertices...")
+                verts_world = torch.from_numpy(mesh.vertices).float().to(self.device)
+                verts_norm = self.normalize_positions(verts_world)
+                dirs = torch.zeros_like(verts_norm)
+                colors_list = []
+                batch = 50000
+                self.model.eval()
+                with torch.no_grad():
+                    for i in range(0, verts_norm.shape[0], batch):
+                        c, _ = self.model(verts_norm[i:i+batch], dirs[i:i+batch])
+                        colors_list.append(c.detach().cpu().numpy())
+                colors_np = (np.concatenate(colors_list, axis=0) * 255).astype(np.uint8)
+                pc = trimesh.PointCloud(mesh.vertices, colors=colors_np)
+                pc_from_mesh_path = self.output_dir / "pointcloud_from_mesh.ply"
+                pc.export(pc_from_mesh_path)
+                print(f"✓ Point cloud (from mesh) saved: {pc_from_mesh_path}")
+            except Exception as e:
+                print(f"  Warning: could not generate point cloud from mesh: {e}")
             
             return mesh
             
         except Exception as e:
-            print(f"\u2717 Marching cubes failed: {e}")
+            print(f"✗ Marching cubes failed: {e}")
             return None
-    
-    def extract_pointcloud(self, num_points: int = 100000):
-        """Extract point cloud by sampling from density field"""
-        try:
-            import trimesh
-        except ImportError:
-            print("\u2717 Please install: pip install trimesh")
-            return None
-        
-        print(f"\\nExtracting point cloud ({num_points} points)...")
-        
-        # Sample random points in normalized space
-        bound = 1.0
-        positions_norm = torch.FloatTensor(num_points, 3).uniform_(-bound, bound).to(self.device)
-        directions = torch.zeros_like(positions_norm)
-        
-        # Query colors and alpha
-        self.model.eval()
-        with torch.no_grad():
-            colors, sigma = self.model(positions_norm, directions)
-        # Use proper step size in world coordinates
-        dt = (2.0 * float(self.scene_radius)) / 128
-        alpha = 1.0 - torch.exp(-sigma.squeeze(-1) * dt)
-        alpha_np = alpha.cpu().numpy()
-        print(f"  Alpha range: [{alpha_np.min():.4f}, {alpha_np.max():.4f}]")
-        print(f"  Alpha mean: {alpha_np.mean():.4f}, std: {alpha_np.std():.4f}")
-        
-        # Adaptive alpha threshold (median of non-zero values)
-        non_zero = alpha_np[alpha_np > 1e-6]
-        if len(non_zero) > 0:
-            threshold = float(np.percentile(non_zero, 50))
-        else:
-            threshold = 1e-6
-        print(f"  Using adaptive alpha threshold: {threshold:.6f}")
-        
-        mask = alpha > threshold
-        
-        # Un-normalize to world coordinates
-        points = (positions_norm[mask] * self.scene_radius + self.scene_center).cpu().numpy()
-        colors = (colors[mask].cpu().numpy() * 255).astype(np.uint8)
-        
-        print(f"  Filtered to {len(points)} points above threshold")
-        
-        # Create point cloud
-        pc = trimesh.PointCloud(points, colors=colors)
-        
-        # Save
-        pc_path = self.output_dir / "pointcloud.ply"
-        pc.export(pc_path)
-        print(f"\u2713 Point cloud saved: {pc_path}")
-        
-        return pc
 
 
 def train_simple_nerf(data_dir: str, output_dir: str, 
                      n_iters: int = 10000,
                      mesh_resolution: int = 128,
-                     num_points: int = 100000,
                      preview_every: int = 0,
                      preview_index: int = 0):
     """
@@ -604,7 +601,6 @@ def train_simple_nerf(data_dir: str, output_dir: str,
         output_dir: Output directory
         n_iters: Training iterations
         mesh_resolution: Marching cubes resolution
-        num_points: Point cloud size
     """
     print("="*70)
     print("INSTANT NGP TRAINING (Hash Encoding)")
@@ -616,9 +612,6 @@ def train_simple_nerf(data_dir: str, output_dir: str,
     
     # Extract mesh
     trainer.extract_mesh(resolution=mesh_resolution)
-    
-    # Extract point cloud
-    trainer.extract_pointcloud(num_points=num_points)
     
     print("="*70)
     print("\u2713 Instant NGP reconstruction completed!")
@@ -632,7 +625,6 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="../reconstructions/InstantNGP_preprocessed/3_reconstruction")
     parser.add_argument("--n_iters", type=int, default=10000)
     parser.add_argument("--mesh_resolution", type=int, default=128)
-    parser.add_argument("--num_points", type=int, default=100000)
     parser.add_argument("--preview_every", type=int, default=0, help="Render RGB/depth previews every N iters (0=disable)")
     parser.add_argument("--preview_index", type=int, default=0, help="Image index to use for preview rendering")
     parser.add_argument("--render_preview", action="store_true", help="Render a preview without training")
@@ -651,7 +643,6 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             n_iters=args.n_iters,
             mesh_resolution=args.mesh_resolution,
-            num_points=args.num_points,
             preview_every=args.preview_every,
             preview_index=args.preview_index,
         )

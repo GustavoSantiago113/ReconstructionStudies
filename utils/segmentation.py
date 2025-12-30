@@ -18,14 +18,14 @@ import cv2
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class ImageSegmenter:
-    def create_black_bg_image(self, image: Image.Image, mask: np.ndarray) -> Image.Image:
+    def create_transparent_image(self, image: Image.Image, mask: np.ndarray) -> Image.Image:
         """
-        Create RGB image with black background (mask=0 is black).
+        Create RGBA image with transparent background (mask=0 is transparent).
         Args:
             image: Original RGB image
             mask: Binary segmentation mask
         Returns:
-            RGB image with black background
+            RGBA image with transparency
         """
         image = image.convert('RGB')
         arr = np.array(image)
@@ -34,8 +34,11 @@ class ImageSegmenter:
             mask_img = PILImage.fromarray((mask * 255).astype(np.uint8))
             mask_img = mask_img.resize((arr.shape[1], arr.shape[0]), Image.BILINEAR)
             mask = (np.array(mask_img) / 255.0 > 0.5).astype(np.uint8)
+        # Zero out RGB where mask==0 to ensure background is transparent black
         arr = arr * mask[..., None]
-        return Image.fromarray(arr.astype(np.uint8), mode='RGB')
+        alpha = (mask * 255).astype(np.uint8)
+        rgba = np.dstack([arr, alpha])
+        return Image.fromarray(rgba, mode='RGBA')
     
     """
     Segments images using trained models and generates transparent backgrounds.
@@ -212,11 +215,11 @@ class ImageSegmenter:
         if refine:
             mask = self.refine_mask(mask, kernel_size)
         
-        # Create black-background composite image (RGB)
-        black_img = self.create_black_bg_image(image, mask)
+        # Create transparent-background composite image (RGBA)
+        transparent_img = self.create_transparent_image(image, mask)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        black_img.save(output_path, 'PNG')
+        transparent_img.save(output_path, 'PNG')
         if return_mask:
             return mask
     
@@ -306,12 +309,12 @@ class ImageSegmenter:
         if refine:
             mask = self.refine_mask(mask, kernel_size)
 
-        # Create black-background image
-        black_img = self.create_black_bg_image(image, mask)
+        # Create transparent-background image
+        transparent_img = self.create_transparent_image(image, mask)
         # Save
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        black_img.save(output_path, 'PNG')
+        transparent_img.save(output_path, 'PNG')
 
 
 def segment_filtered_images(filtered_images_dir: str, 

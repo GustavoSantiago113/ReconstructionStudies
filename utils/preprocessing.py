@@ -114,7 +114,7 @@ class ImagePreprocessor:
     
     def _estimate_poses_opencv(self, images_data: List[Dict]) -> Dict[str, Dict]:
         """
-        Estimate camera poses using OpenCV sequential matching.
+        Estimate camera poses using OpenCV sequential matching with 360° loop closure.
         """
         import cv2
         
@@ -129,6 +129,68 @@ class ImagePreprocessor:
             [0, 0, 1]
         ], dtype=np.float64)
         
+        # Build match graph for 360° sequences
+        print("  - Building match graph with RANSAC...")
+        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        
+        # Match consecutive images AND wrap around for 360°
+        relative_poses = {}
+        
+        for i in range(len(images_data)):
+            # Match with next image (including last->first for loop closure)
+            j = (i + 1) % len(images_data)
+            
+            desc1 = images_data[i]['descriptors']
+            desc2 = images_data[j]['descriptors']
+            
+            if desc1 is None or desc2 is None:
+                continue
+            
+            matches = bf.knnMatch(desc1, desc2, k=2)
+            
+            # Apply ratio test (Lowe's ratio)
+            good_matches = []
+            for m_n in matches:
+                if len(m_n) == 2:
+                    m, n = m_n
+                    if m.distance < 0.75 * n.distance:
+                        good_matches.append(m)
+            
+            if len(good_matches) < 15:
+                continue
+            
+            # Get matched points
+            pts1 = np.float32([images_data[i]['keypoints'][m.queryIdx].pt for m in good_matches])
+            pts2 = np.float32([images_data[j]['keypoints'][m.trainIdx].pt for m in good_matches])
+            
+            # Estimate essential matrix with RANSAC
+            E, mask = cv2.findEssentialMat(pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+            
+            if E is None or mask is None:
+                continue
+            
+            # Filter inliers
+            inliers = mask.ravel().astype(bool)
+            if np.sum(inliers) < 15:
+                continue
+            
+            pts1_inliers = pts1[inliers]
+            pts2_inliers = pts2[inliers]
+            
+            # Recover pose
+            _, R, t, pose_mask = cv2.recoverPose(E, pts1_inliers, pts2_inliers, K)
+            
+            relative_poses[(i, j)] = {
+                'R': R,
+                't': t.flatten(),
+                'inliers': np.sum(pose_mask)
+            }
+            
+            print(f"    Matched images {i} <-> {j}: {np.sum(pose_mask)} inliers")
+        
+        # Build absolute poses by chaining transformations in a circle
+        print("  - Computing absolute camera poses...")
+        
         # First camera at origin
         R0 = np.eye(3)
         t0 = np.zeros(3)
@@ -142,65 +204,48 @@ class ImagePreprocessor:
             'image_id': 1
         }
         
-        # Match consecutive images
-        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-        
+        # Chain transformations
         for i in range(len(images_data) - 1):
-            desc1 = images_data[i]['descriptors']
-            desc2 = images_data[i+1]['descriptors']
+            j = i + 1
             
-            if desc1 is None or desc2 is None:
+            if (i, j) not in relative_poses:
+                # Copy previous pose if no match found
+                if images_data[i]['file'].name in poses:
+                    prev_pose = poses[images_data[i]['file'].name]
+                    poses[images_data[j]['file'].name] = prev_pose.copy()
+                    poses[images_data[j]['file'].name]['image_id'] = j + 1
                 continue
             
-            matches = bf.knnMatch(desc1, desc2, k=2)
+            rel_pose = relative_poses[(i, j)]
+            R_rel = rel_pose['R']
+            t_rel = rel_pose['t']
             
-            # Apply ratio test
-            good_matches = []
-            for m_n in matches:
-                if len(m_n) == 2:
-                    m, n = m_n
-                    if m.distance < 0.7 * n.distance:
-                        good_matches.append(m)
-            
-            if len(good_matches) < 8:
-                # Use previous pose if matching fails
-                prev_pose = poses[images_data[i]['file'].name]
-                poses[images_data[i+1]['file'].name] = prev_pose.copy()
-                poses[images_data[i+1]['file'].name]['image_id'] = i + 2
-                continue
-            
-            # Get matched points
-            pts1 = np.float32([images_data[i]['keypoints'][m.queryIdx].pt for m in good_matches])
-            pts2 = np.float32([images_data[i+1]['keypoints'][m.trainIdx].pt for m in good_matches])
-            
-            # Estimate essential matrix
-            E, mask = cv2.findEssentialMat(pts1, pts2, K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
-            
-            if E is None:
-                prev_pose = poses[images_data[i]['file'].name]
-                poses[images_data[i+1]['file'].name] = prev_pose.copy()
-                poses[images_data[i+1]['file'].name]['image_id'] = i + 2
-                continue
-            
-            # Recover pose
-            _, R, t, mask = cv2.recoverPose(E, pts1, pts2, K)
-            
-            # Accumulate transformation
+            # Get previous absolute pose
             prev_pose = poses[images_data[i]['file'].name]
             R_prev = prev_pose['rotation']
             t_prev = prev_pose['translation']
             
-            R_new = R @ R_prev
-            t_new = t_prev + R_prev.T @ t.flatten()
+            # Compute new absolute pose: R_new = R_rel @ R_prev, t_new = R_prev.T @ t_rel + t_prev
+            R_new = R_rel @ R_prev
+            t_new = R_prev.T @ t_rel + t_prev
             
-            poses[images_data[i+1]['file'].name] = {
+            # Normalize to prevent drift
+            t_new = t_new / (np.linalg.norm(t_new) + 1e-6) * ((i + 1) / len(images_data)) * 2.0
+            
+            poses[images_data[j]['file'].name] = {
                 'rotation': R_new,
                 'translation': t_new,
                 'camera_center': -R_new.T @ t_new,
                 'quaternion': self._rotmat_to_quat(R_new),
                 'camera_id': 1,
-                'image_id': i + 2
+                'image_id': j + 1
             }
+        
+        # Check loop closure quality
+        if (len(images_data) - 1, 0) in relative_poses:
+            print(f"  ✓ Loop closure detected: {relative_poses[(len(images_data) - 1, 0)]['inliers']} inliers")
+        else:
+            print(f"  ⚠ No loop closure found (last image doesn't match first)")
         
         return poses
     

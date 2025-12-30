@@ -7,4 +7,6 @@ reconstructions/*
 !reconstructions/meshroom_20_True.ply
 !reconstructions/DA3_10_True.ply
 frames/
+notebooks/gnsolution.ipynb
+utils/gnsolutions_utils.py
 360_video.mp4

@@ -7,7 +7,7 @@ def select_equally_distributed_images(image_folder, n):
     Returns a list of file paths.
     """
     # Get all stop_{number} images, sorted by number
-    files = [f for f in os.listdir(image_folder) if f.startswith('stop_') and f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    files = [f for f in os.listdir(image_folder)]
     # Extract numbers and sort
     numbered = sorted([(int(f.split('_')[1][:2]), f) for f in files])
     if not numbered:

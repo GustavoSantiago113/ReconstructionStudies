@@ -53,7 +53,6 @@ class NeRFReconstructor:
     def run_full_reconstruction(self,
                                max_iterations: int = 10000,
                                mesh_resolution: int = 128,
-                               num_points: int = 100000,
                                preview_every: int = 1000,
                                preview_index: int = 0) -> bool:
         """
@@ -62,7 +61,6 @@ class NeRFReconstructor:
         Args:
             max_iterations: Training iterations
             mesh_resolution: Marching cubes resolution
-            num_points: Number of points in point cloud
             method: NeRF method to use ("simple-nerf" or nerfstudio methods)
             
         Returns:
@@ -80,7 +78,6 @@ class NeRFReconstructor:
                 output_dir=str(self.output_dir),
                 n_iters=max_iterations,
                 mesh_resolution=mesh_resolution,
-                num_points=num_points,
                 preview_every=preview_every,
                 preview_index=preview_index
             )
@@ -96,82 +93,6 @@ class NeRFReconstructor:
         
         return True
 
-
-class MarchingCubesExtractor:
-    """
-    Extract meshes from density fields using marching cubes algorithm.
-    """
-    
-    @staticmethod
-    def extract_mesh_from_density(density_func,
-                                  bounds: Tuple[float, float, float],
-                                  resolution: int = 256,
-                                  threshold: float = 10.0,
-                                  output_path: Optional[str] = None):
-        """
-        Extract mesh using marching cubes.
-        
-        Args:
-            density_func: Function that takes (N, 3) positions and returns (N,) densities
-            bounds: (min, max) bounds for each axis
-            resolution: Grid resolution
-            threshold: Density threshold for isosurface
-            output_path: Optional path to save mesh
-            
-        Returns:
-            mesh: Trimesh object
-        """
-        try:
-            import trimesh
-            from skimage import measure
-            
-            print(f"Extracting mesh with marching cubes (resolution: {resolution})...")
-            
-            # Create grid
-            x = np.linspace(-bounds[0], bounds[0], resolution)
-            y = np.linspace(-bounds[1], bounds[1], resolution)
-            z = np.linspace(-bounds[2], bounds[2], resolution)
-            
-            xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
-            positions = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
-            
-            # Evaluate density
-            print("  Evaluating density field...")
-            densities = density_func(positions)
-            density_grid = densities.reshape(resolution, resolution, resolution)
-            
-            # Run marching cubes
-            print("  Running marching cubes...")
-            verts, faces, normals, values = measure.marching_cubes(
-                density_grid,
-                level=threshold,
-                spacing=(2*bounds[0]/resolution, 
-                        2*bounds[1]/resolution, 
-                        2*bounds[2]/resolution)
-            )
-            
-            # Offset vertices to correct position
-            verts = verts - np.array([bounds[0], bounds[1], bounds[2]])
-            
-            # Create mesh
-            mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
-            
-            # Save if requested
-            if output_path:
-                mesh.export(output_path)
-                print(f"✓ Mesh saved to {output_path}")
-            
-            return mesh
-            
-        except ImportError:
-            print("✗ Required packages not installed:")
-            print("  pip install trimesh scikit-image")
-            return None
-        except Exception as e:
-            print(f"✗ Error in marching cubes: {e}")
-            return None
-
-
 if __name__ == "__main__":
     # Example usage
     reconstructor = NeRFReconstructor(
@@ -182,7 +103,6 @@ if __name__ == "__main__":
     reconstructor.run_full_reconstruction(
         max_iterations=30000,
         mesh_resolution=1024,
-        num_points=1000000,
         preview_every=1000,
         preview_index=0
     )

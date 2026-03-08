@@ -1,12 +1,3 @@
 images_train/
 models/
-reconstructions/*
-!reconstructions/vggt_10_False.ply
-!reconstructions/dust3r_4_True.ply
-!reconstructions/colmap_20_False.ply
-!reconstructions/meshroom_20_True.ply
-!reconstructions/DA3_10_True.ply
 frames/
-notebooks/gnsolution.ipynb
-utils/gnsolutions_utils.py
-360_video.mp4

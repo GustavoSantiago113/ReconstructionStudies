@@ -21,6 +21,7 @@ from typing import List, Tuple, Dict, Optional
 
 import cv2
 import numpy as np
+import open3d as o3d
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -842,49 +843,131 @@ def plot_epipolar_lines(
     return fig
 
 
+def create_camera_frustum(
+    R: np.ndarray,
+    t: np.ndarray,
+    K: np.ndarray,
+    scale: float = 0.1,
+    color: Tuple[float, float, float] = (1.0, 0.0, 0.0),
+) -> o3d.geometry.LineSet:
+    """Create a camera frustum visualization for Open3D.
+    
+    Parameters
+    ----------
+    R : (3,3) rotation matrix (world to camera)
+    t : (3,1) or (3,) translation vector
+    K : (3,3) camera intrinsic matrix
+    scale : frustum size
+    color : RGB color tuple (0-1 range)
+    
+    Returns
+    -------
+    frustum : Open3D LineSet representing the camera frustum
+    """
+    # Camera center in world coordinates: C = -R^T @ t
+    t_vec = t.ravel()
+    cam_center = -R.T @ t_vec
+    
+    # Define image corners in normalized image coordinates
+    w, h = 640, 480  # arbitrary image size for visualization
+    corners_img = np.array([
+        [0, 0, 1],
+        [w, 0, 1],
+        [w, h, 1],
+        [0, h, 1],
+    ], dtype=np.float64)
+    
+    # Unproject to camera space
+    K_inv = np.linalg.inv(K)
+    corners_cam = (K_inv @ corners_img.T).T * scale
+    
+    # Transform to world space: x_world = R^T @ (x_cam - t)
+    corners_world = (corners_cam - t_vec) @ R
+    
+    # Create frustum points: camera center + 4 corners
+    points = np.vstack([cam_center.reshape(1, 3), corners_world])
+    
+    # Define lines connecting camera center to corners and corners to each other
+    lines = [
+        [0, 1], [0, 2], [0, 3], [0, 4],  # Center to corners
+        [1, 2], [2, 3], [3, 4], [4, 1],  # Rectangle of image plane
+    ]
+    
+    frustum = o3d.geometry.LineSet()
+    frustum.points = o3d.utility.Vector3dVector(points)
+    frustum.lines = o3d.utility.Vector2iVector(lines)
+    frustum.colors = o3d.utility.Vector3dVector([color for _ in lines])
+    
+    return frustum
+
+
 def plot_3d_reconstruction(
     recon: SfMReconstruction,
     title: str = "SfM 3-D Reconstruction",
     point_size: float = 1.0,
     subsample: int = 5000,
-) -> plt.Figure:
-    """Plot 3-D points and camera centres using matplotlib."""
+    window_name: str = "SfM Reconstruction",
+) -> None:
+    """Visualize 3-D points and camera poses using Open3D.
+    
+    Parameters
+    ----------
+    recon : SfMReconstruction object
+    title : window title
+    point_size : point cloud point size
+    subsample : maximum number of points to display
+    window_name : Open3D window name
+    """
     pts3d = recon.get_points_array()
-    cam_centers = recon.get_camera_centers()
-
-    fig = plt.figure(figsize=(12, 8))
-    ax = fig.add_subplot(111, projection="3d")
-
+    geometries = []
+    
     if len(pts3d) > 0:
         # Remove outliers (simple percentile clip)
+        pts_filtered = pts3d.copy()
         for axis in range(3):
-            low, high = np.percentile(pts3d[:, axis], [2, 98])
-            pts3d = pts3d[(pts3d[:, axis] >= low) & (pts3d[:, axis] <= high)]
-
-        if len(pts3d) > subsample:
-            idx = np.random.choice(len(pts3d), subsample, replace=False)
-            pts3d = pts3d[idx]
-
-        ax.scatter(pts3d[:, 0], pts3d[:, 1], pts3d[:, 2],
-                   s=point_size, c="steelblue", alpha=0.5, label="3-D points")
-
-    if len(cam_centers) > 0:
-        ax.scatter(cam_centers[:, 0], cam_centers[:, 1], cam_centers[:, 2],
-                   s=60, c="red", marker="^", zorder=5, label="Cameras")
-        for j, c in enumerate(cam_centers):
-            ax.text(c[0], c[1], c[2], f" C{j}", fontsize=8, color="red")
-
-        # Draw camera trajectory
-        ax.plot(cam_centers[:, 0], cam_centers[:, 1], cam_centers[:, 2],
-                "r--", alpha=0.6, linewidth=1)
-
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    ax.set_title(title)
-    ax.legend()
-    fig.tight_layout()
-    return fig
+            low, high = np.percentile(pts_filtered[:, axis], [2, 98])
+            pts_filtered = pts_filtered[(pts_filtered[:, axis] >= low) & (pts_filtered[:, axis] <= high)]
+        
+        if len(pts_filtered) > subsample:
+            idx = np.random.choice(len(pts_filtered), subsample, replace=False)
+            pts_filtered = pts_filtered[idx]
+        
+        # Create point cloud
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts_filtered)
+        pcd.paint_uniform_color([0.2, 0.5, 0.8])  # Steel blue
+        geometries.append(pcd)
+    
+    # Add camera frustums
+    cam_ids = sorted(recon.camera_poses.keys())
+    for cid in cam_ids:
+        R, t = recon.camera_poses[cid]
+        frustum = create_camera_frustum(R, t, recon.K, scale=0.2, color=(1.0, 0.0, 0.0))
+        geometries.append(frustum)
+    
+    # Add camera trajectory line
+    if len(cam_ids) > 1:
+        cam_centers = recon.get_camera_centers()
+        line_set = o3d.geometry.LineSet()
+        line_set.points = o3d.utility.Vector3dVector(cam_centers)
+        lines = [[i, i+1] for i in range(len(cam_centers)-1)]
+        line_set.lines = o3d.utility.Vector2iVector(lines)
+        line_set.colors = o3d.utility.Vector3dVector([[1.0, 0.0, 0.0] for _ in lines])
+        geometries.append(line_set)
+    
+    # Add coordinate frame at origin
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=[0, 0, 0])
+    geometries.append(coord_frame)
+    
+    # Visualize
+    o3d.visualization.draw_geometries(
+        geometries,
+        window_name=window_name,
+        width=1200,
+        height=800,
+        point_show_normal=False,
+    )
+    print(f"Displayed: {len(pts3d)} total points, {len(cam_ids)} cameras")
 
 
 def plot_reprojection(

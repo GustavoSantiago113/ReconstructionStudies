@@ -388,6 +388,33 @@ class SfMReconstruction:
             centers.append(C.ravel())
         return np.array(centers) if centers else np.empty((0, 3))
 
+    def get_points_and_colors(
+        self, images: List[np.ndarray]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (N,3) points and (N,3) uint8 RGB colors sampled from images.
+
+        For each 3-D point the pixel colour is taken from its first observation
+        whose image index is valid.  Points with no valid observation get grey.
+        """
+        track_ids = sorted(self.points3d.keys())
+        pts, colors = [], []
+        for tid in track_ids:
+            pts.append(self.points3d[tid])
+            color = np.array([128, 128, 128], dtype=np.uint8)
+            for img_idx, uv in self.observations.get(tid, []):
+                if img_idx < len(images):
+                    img = images[img_idx]
+                    h, w = img.shape[:2]
+                    u = int(np.clip(round(uv[0]), 0, w - 1))
+                    v = int(np.clip(round(uv[1]), 0, h - 1))
+                    bgr = img[v, u]
+                    color = np.array([bgr[2], bgr[1], bgr[0]], dtype=np.uint8)
+                    break
+            colors.append(color)
+        if not pts:
+            return np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8)
+        return np.array(pts), np.array(colors, dtype=np.uint8)
+
 
 def run_sfm(
     image_paths: List[str],
@@ -672,10 +699,24 @@ def bundle_adjustment(
     if verbose:
         print(f"Running BA: {n_cams} cameras, {n_pts} points, {len(pts2d_obs)} observations.")
 
+    # Build sparse Jacobian sparsity pattern to avoid dense 21+ GiB allocation.
+    # Each observation produces 2 residuals; each residual depends on 6 camera
+    # params and 3 point params, so we mark those columns as non-zero.
+    from scipy.sparse import lil_matrix
+    n_obs = len(pts2d_obs)
+    n_params = n_cams * 6 + n_pts * 3
+    sparsity = lil_matrix((2 * n_obs, n_params), dtype=int)
+    for i, (ci, pi) in enumerate(zip(cam_indices, pt_indices)):
+        row = 2 * i
+        sparsity[row:row + 2, ci * 6: ci * 6 + 6] = 1
+        col_pt = n_cams * 6 + pi * 3
+        sparsity[row:row + 2, col_pt: col_pt + 3] = 1
+
     result = least_squares(
         _ba_residuals,
         x0,
-        method="lm",
+        jac_sparsity=sparsity,
+        method="trf",
         args=(n_cams, n_pts, cam_indices, pt_indices, pts2d_obs, K),
         max_nfev=max_nfev,
         verbose=2 if verbose else 0,
@@ -907,6 +948,7 @@ def plot_3d_reconstruction(
     point_size: float = 1.0,
     subsample: int = 5000,
     window_name: str = "SfM Reconstruction",
+    images: Optional[List[np.ndarray]] = None,
 ) -> None:
     """Visualize 3-D points and camera poses using Open3D.
     
@@ -917,25 +959,36 @@ def plot_3d_reconstruction(
     point_size : point cloud point size
     subsample : maximum number of points to display
     window_name : Open3D window name
+    images : source images used for sampling point colours; if None, uniform blue is used
     """
-    pts3d = recon.get_points_array()
+    if images is not None:
+        pts3d, colors_rgb = recon.get_points_and_colors(images)
+    else:
+        pts3d = recon.get_points_array()
+        colors_rgb = None
     geometries = []
     
     if len(pts3d) > 0:
         # Remove outliers (simple percentile clip)
-        pts_filtered = pts3d.copy()
+        mask = np.ones(len(pts3d), dtype=bool)
         for axis in range(3):
-            low, high = np.percentile(pts_filtered[:, axis], [2, 98])
-            pts_filtered = pts_filtered[(pts_filtered[:, axis] >= low) & (pts_filtered[:, axis] <= high)]
+            low, high = np.percentile(pts3d[:, axis], [2, 98])
+            mask &= (pts3d[:, axis] >= low) & (pts3d[:, axis] <= high)
+        pts_filtered = pts3d[mask]
+        colors_filtered = colors_rgb[mask] if colors_rgb is not None else None
         
         if len(pts_filtered) > subsample:
             idx = np.random.choice(len(pts_filtered), subsample, replace=False)
             pts_filtered = pts_filtered[idx]
+            colors_filtered = colors_filtered[idx] if colors_filtered is not None else None
         
         # Create point cloud
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts_filtered)
-        pcd.paint_uniform_color([0.2, 0.5, 0.8])  # Steel blue
+        if colors_filtered is not None:
+            pcd.colors = o3d.utility.Vector3dVector(colors_filtered.astype(np.float64) / 255.0)
+        else:
+            pcd.paint_uniform_color([0.2, 0.5, 0.8])  # Steel blue fallback
         geometries.append(pcd)
     
     # Add camera frustums

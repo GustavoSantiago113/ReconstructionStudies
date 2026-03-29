@@ -231,9 +231,11 @@ def volume_render(
 
     Returns
     -------
-    colour  : (R, 3)
-    depth   : (R,)
-    weights : (R, S)   useful for importance sampling.
+    colour   : (R, 3)
+    disp_map : (R,)   disparity map (inverse of depth, weighted by acc).
+    acc_map  : (R,)   accumulated opacity along each ray.
+    weights  : (R, S) useful for importance sampling.
+    depth    : (R,)   expected depth along each ray.
     """
     # Step sizes in t-space; treat the last step as infinite
     dists = t_vals[..., 1:] - t_vals[..., :-1]                              # (R, S-1)
@@ -252,11 +254,15 @@ def volume_render(
     weights = T * alpha                                                     # (R, S)
     colour = (weights.unsqueeze(-1) * rgb).sum(dim=-2)                     # (R, 3)
     depth = (weights * t_vals).sum(dim=-1)                                 # (R,)
+    acc_map = weights.sum(dim=-1)                                          # (R,)
+    disp_map = 1.0 / torch.max(
+        1e-10 * torch.ones_like(depth), depth / acc_map.clamp(min=1e-10)
+    )                                                                      # (R,)
 
     if white_bg:
-        colour = colour + (1.0 - weights.sum(dim=-1, keepdim=True))
+        colour = colour + (1.0 - acc_map.unsqueeze(-1))
 
-    return colour, depth, weights
+    return colour, disp_map, acc_map, weights, depth
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +649,8 @@ def render_image(
     -------
     rgb_img   : (H, W, 3) float32 in [0, 1].
     depth_img : (H, W)    float32 (normalised scene units).
+    disp_img  : (H, W)    float32 disparity map.
+    acc_img   : (H, W)    float32 accumulated opacity in [0, 1].
     """
     model.eval()
     if coarse_model is not None:
@@ -652,14 +660,15 @@ def render_image(
     rays_o = rays_o.reshape(-1, 3)
     rays_d = rays_d.reshape(-1, 3)
 
-    rgb_chunks, depth_chunks = [], []
+    rgb_chunks, depth_chunks, disp_chunks, acc_chunks = [], [], [], []
     for start in range(0, rays_o.shape[0], chunk):
         ro = rays_o[start : start + chunk]
         rd = rays_d[start : start + chunk]
         B  = ro.shape[0]
 
         # ── Coarse pass ──────────────────────────────────────────────────────
-        t_c  = sample_stratified(near, far, n_coarse, B, device=device)  # (B, Sc)
+        t_c  = sample_stratified(near, far, n_coarse, B, device=device,
+                                 perturb=False)                          # (B, Sc)
         pts  = ro[:, None] + rd[:, None] * t_c[..., None]                # (B, Sc, 3)
         d_n  = F.normalize(rd, dim=-1)[:, None].expand_as(pts)           # (B, Sc, 3)
         src  = coarse_model if coarse_model is not None else model
@@ -669,7 +678,7 @@ def render_image(
 
         if coarse_model is not None and n_fine > 0:
             # ── Fine pass (hierarchical importance sampling) ─────────────────
-            _, _, w_c = volume_render(rgb_c, sig_c, t_c, rd, white_bg=white_bg)
+            _, _, _, w_c, _ = volume_render(rgb_c, sig_c, t_c, rd, white_bg=white_bg)
             t_mid  = 0.5 * (t_c[..., 1:] + t_c[..., :-1])               # (B, Sc-1)
             w_mid  = 0.5 * (w_c[..., :-1] + w_c[..., 1:])               # (B, Sc-1)
             t_f    = sample_pdf(t_mid, w_mid, n_fine, perturb=False)     # (B, Sf)
@@ -681,10 +690,56 @@ def render_image(
             sig_c  = sig_c.reshape(B, -1, 1)
             t_c    = t_all
 
-        colour, depth, _ = volume_render(rgb_c, sig_c, t_c, rd, white_bg=white_bg)
+        colour, disp, acc, _, depth = volume_render(rgb_c, sig_c, t_c, rd, white_bg=white_bg)
         rgb_chunks.append(colour.cpu())
         depth_chunks.append(depth.cpu())
+        disp_chunks.append(disp.cpu())
+        acc_chunks.append(acc.cpu())
 
     rgb_img   = torch.cat(rgb_chunks).reshape(H, W, 3).numpy()
     depth_img = torch.cat(depth_chunks).reshape(H, W).numpy()
-    return rgb_img.clip(0.0, 1.0).astype(np.float32), depth_img.astype(np.float32)
+    disp_img  = torch.cat(disp_chunks).reshape(H, W).numpy()
+    acc_img   = torch.cat(acc_chunks).reshape(H, W).numpy()
+    return (
+        rgb_img.clip(0.0, 1.0).astype(np.float32),
+        depth_img.astype(np.float32),
+        disp_img.astype(np.float32),
+        acc_img.astype(np.float32),
+    )
+
+
+def visualize_depth(
+    depth: np.ndarray,
+    acc: np.ndarray,
+    acc_threshold: float = 0.1,
+    lo_pct: float = 2.0,
+    hi_pct: float = 98.0,
+) -> np.ndarray:
+    """Produce a clean uint8 depth visualisation.
+
+    Masks out low-opacity pixels (where the model is uncertain) and uses
+    percentile-based normalisation to avoid outlier-driven scaling.
+
+    Parameters
+    ----------
+    depth : (H, W) raw depth map.
+    acc   : (H, W) accumulated opacity in [0, 1].
+    acc_threshold : pixels with acc below this are treated as background.
+    lo_pct, hi_pct : percentile range for normalisation (applied to
+        foreground pixels only).
+
+    Returns
+    -------
+    vis : (H, W) uint8 image suitable for saving as PNG.
+    """
+    valid = acc > acc_threshold
+    if valid.sum() < 10:
+        # Not enough valid pixels — fall back to uniform grey
+        return np.full(depth.shape, 128, dtype=np.uint8)
+    d_valid = depth[valid]
+    lo = float(np.percentile(d_valid, lo_pct))
+    hi = float(np.percentile(d_valid, hi_pct))
+    d_norm = np.clip((depth - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+    # Background → white (1.0)
+    d_norm[~valid] = 1.0
+    return (d_norm * 255).astype(np.uint8)

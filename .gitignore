@@ -1,5 +1,4 @@
 images_train/
 models/
 data/images/
-results/nerf_miniature/flyaround/
-results/nerf_miniature/renders/
+results/

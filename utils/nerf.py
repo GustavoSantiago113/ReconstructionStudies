@@ -1,33 +1,3 @@
-"""
-nerf.py – Fast NeRF building blocks for COLMAP-based Neural Radiance Fields.
-
-Key components
---------------
-PositionalEncoding  : Fourier feature embedding (Mildenhall et al. 2020).
-TinyNeRF            : Compact all-in-one MLP, ideal for quick experiments.
-FastNeRFModel       : Factored position/direction MLP (Garbin et al. 2021);
-                      separates a position branch (density + radiance basis)
-                      from a lightweight view-direction weighting branch,
-                      enabling voxel-grid caching for ~200× faster rendering.
-volume_render       : Differentiable alpha-compositing along a ray.
-sample_stratified   : Jittered uniform sampling in [near, far].
-sample_pdf          : Inverse-CDF importance sampling for hierarchical NeRF.
-get_rays            : Build per-pixel ray bundles from camera intrinsics + c2w.
-qvec_to_rotmat      : COLMAP quaternion → 3×3 rotation matrix.
-colmap_to_c2w       : COLMAP (qvec, tvec) → 4×4 camera-to-world matrix.
-colmap_intrinsics   : COLMAP camera dict → 3×3 K matrix.
-ColmapNeRFDataset   : Loads images + COLMAP binary poses, normalises the scene,
-                      pre-computes every ray, and exposes batched random sampling.
-render_image        : Render a full H×W image from a trained model in chunks.
-
-References
-----------
-* Mildenhall et al. "NeRF: Representing Scenes as Neural Radiance Fields
-  for View Synthesis." ECCV 2020.
-* Garbin et al. "FastNeRF: High-Fidelity Neural Rendering at 200FPS."
-  ICCV 2021. https://arxiv.org/abs/2103.10380
-"""
-
 from __future__ import annotations
 
 import sys
@@ -40,88 +10,447 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
+# ---------------------------------------------------------------------------
+# Ray Batching
+# ---------------------------------------------------------------------------
+def get_rays_np(H, W, K, c2w):
+    i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
+    dirs = np.stack([(i-K[0][2])/K[0][0],
+                     -(j-K[1][2])/K[1][1],
+                     -np.ones_like(i)], -1)
+    # Rotate ray directions from camera frame to the world frame
+    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    # Translate camera frame's origin to the world frame. It is the origin of all rays.
+    rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
+    return rays_o, rays_d
+
+
+def get_rays(H: int, W: int, K, c2w: torch.Tensor):
+    """Generate rays for every pixel (PyTorch version).
+
+    Parameters
+    ----------
+    K : torch.Tensor (3, 3) intrinsic matrix **or** scalar focal length.
+    c2w : torch.Tensor (4, 4) or (3, 4) camera-to-world matrix.
+    """
+    device = c2w.device
+    i, j = torch.meshgrid(
+        torch.arange(W, dtype=torch.float32, device=device),
+        torch.arange(H, dtype=torch.float32, device=device),
+        indexing='xy',
+    )
+    if isinstance(K, torch.Tensor) and K.dim() >= 2:
+        dirs = torch.stack([
+            (i - K[0, 2]) / K[0, 0],
+            -(j - K[1, 2]) / K[1, 1],
+            -torch.ones_like(i),
+        ], dim=-1)
+    else:
+        focal = float(K) if not isinstance(K, torch.Tensor) else K.item()
+        dirs = torch.stack([
+            (i - W * 0.5) / focal,
+            -(j - H * 0.5) / focal,
+            -torch.ones_like(i),
+        ], dim=-1)
+    rays_d = torch.sum(dirs[..., None, :] * c2w[:3, :3], dim=-1)
+    rays_o = c2w[:3, 3].expand_as(rays_d)
+    return rays_o, rays_d
+
+
+# ---------------------------------------------------------------------------
+# Embedding
+# ---------------------------------------------------------------------------
+class Embedder:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.create_embedding_fn()
+         
+    def create_embedding_fn(self):
+        embed_fns = []
+        d = self.kwargs['input_dims']
+        out_dim = 0
+        if self.kwargs['include_input']:
+            embed_fns.append(lambda x : x)
+            out_dim += d
+             
+        max_freq = self.kwargs['max_freq_log2']
+        N_freqs = self.kwargs['num_freqs']
+         
+        if self.kwargs['log_sampling']:
+            freq_bands = 2.**torch.linspace(0., max_freq, steps=N_freqs)
+        else:
+            freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
+             
+        for freq in freq_bands:
+            for p_fn in self.kwargs['periodic_fns']:
+                embed_fns.append(lambda x, p_fn=p_fn, freq=freq : p_fn(x * freq))
+                out_dim += d
+                     
+        self.embed_fns = embed_fns
+        self.out_dim = out_dim
+         
+    def embed(self, inputs):
+        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+ 
+def get_embedder(multires, i=0):
+    if i == -1:
+        return nn.Identity(), 3
+     
+    embed_kwargs = {
+                'include_input' : True,
+                'input_dims' : 3,
+                'max_freq_log2' : multires-1,
+                'num_freqs' : multires,
+                'log_sampling' : True,
+                'periodic_fns' : [torch.sin, torch.cos],
+    }
+     
+    embedder_obj = Embedder(**embed_kwargs)
+    embed = lambda x, eo=embedder_obj : eo.embed(x)
+    return embed, embedder_obj.out_dim
 
 # ---------------------------------------------------------------------------
 # Positional encoding
 # ---------------------------------------------------------------------------
 
-class PositionalEncoding(nn.Module):
-    """Fourier feature positional encoding (NeRF-style).
+def pos_enc(x, L_embed=6):
+    rets = [x]
+    for i in range(L_embed):
+        for fn in [torch.sin, torch.cos]:
+            rets.append(fn(2.**i * x))
+    return torch.cat(rets, dim=-1)
 
-    Maps an input vector of dimension D to
-    ``[x, sin(2⁰·x), cos(2⁰·x), …, sin(2^{L-1}·x), cos(2^{L-1}·x)]``
-    where L = ``num_frequencies``.  Higher frequencies capture fine detail.
+# ------------------------------------------------------------------------------
+# NeRF MLP
+# ------------------------------------------------------------------------------
+
+class NeRF(nn.Module):
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
+        super(NeRF, self).__init__()
+        self.D = D
+        self.W = W
+        self.input_ch = input_ch
+        self.input_ch_views = input_ch_views
+        self.skips = skips
+        self.use_viewdirs = use_viewdirs
+ 
+        self.pts_linears = nn.ModuleList(
+            [nn.Linear(input_ch, W)] +
+            [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)]
+        )
+ 
+        self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
+ 
+        if use_viewdirs:
+            self.feature_linear = nn.Linear(W, W)
+            self.alpha_linear = nn.Linear(W, 1)
+            self.rgb_linear = nn.Linear(W//2, 3)
+        else:
+            self.output_linear = nn.Linear(W, output_ch)
+ 
+    def forward(self, x):
+        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
+        h = input_pts
+        for i, l in enumerate(self.pts_linears):
+            h = self.pts_linears[i](h)
+            h = F.relu(h)
+            if i in self.skips:
+                h = torch.cat([input_pts, h], -1)
+ 
+        if self.use_viewdirs:
+            alpha = self.alpha_linear(h)
+            feature = self.feature_linear(h)
+            h = torch.cat([feature, input_views], -1)
+ 
+            for i, l in enumerate(self.views_linears):
+                h = self.views_linears[i](h)
+                h = F.relu(h)
+ 
+            rgb = self.rgb_linear(h)
+            outputs = torch.cat([rgb, alpha], -1)
+        else:
+            outputs = self.output_linear(h)
+ 
+        return outputs
+
+# ---------------------------------------------------------------------------
+# Instant-NGP: Multiresolution Hash Encoding  (Müller et al. 2022)
+# ---------------------------------------------------------------------------
+
+def sh_encode_directions(d: torch.Tensor) -> torch.Tensor:
+    """Third-order real spherical harmonics (16 coefficients, degree 0–3).
+
+    Parameters
+    ----------
+    d : (..., 3) unit direction vectors.
+
+    Returns
+    -------
+    (..., 16) SH features.
     """
+    x, y, z = d[..., 0], d[..., 1], d[..., 2]
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    return torch.stack([
+        # degree 0
+        0.28209479177387814 * torch.ones_like(x),
+        # degree 1
+        -0.4886025119029199  * y,
+         0.4886025119029199  * z,
+        -0.4886025119029199  * x,
+        # degree 2
+         1.0925484305920792  * xy,
+        -1.0925484305920792  * yz,
+         0.31539156525252005 * (2.0 * zz - xx - yy),
+        -1.0925484305920792  * xz,
+         0.5462742152960396  * (xx - yy),
+        # degree 3
+        -0.5900435899266435  * y * (3.0 * xx - yy),
+         2.890611442640554   * xy * z,
+        -0.4570457994644658  * y * (4.0 * zz - xx - yy),
+         0.3731763325901154  * z * (2.0 * zz - 3.0 * xx - 3.0 * yy),
+        -0.4570457994644658  * x * (4.0 * zz - xx - yy),
+         1.445305721320277   * z * (xx - yy),
+        -0.5900435899266435  * x * (xx - 3.0 * yy),
+    ], dim=-1)
 
-    def __init__(self, num_frequencies: int = 10, include_input: bool = True) -> None:
-        super().__init__()
-        self.num_frequencies = num_frequencies
-        self.include_input = include_input
-        freqs = 2.0 ** torch.arange(num_frequencies, dtype=torch.float32)
-        self.register_buffer("freqs", freqs)
 
-    def out_dim(self, input_dim: int = 3) -> int:
-        d = 2 * self.num_frequencies * input_dim
-        return d + input_dim if self.include_input else d
+class MultiresHashEncoding(nn.Module):
+    """Multiresolution hash grid encoding from Instant-NGP.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (..., D) → (..., out_dim)
-        parts = [x] if self.include_input else []
-        for freq in self.freqs:
-            parts.extend([torch.sin(freq * x), torch.cos(freq * x)])
-        return torch.cat(parts, dim=-1)
-
-
-# ---------------------------------------------------------------------------
-# TinyNeRF – compact all-in-one MLP (great for prototyping)
-# ---------------------------------------------------------------------------
-
-class TinyNeRF(nn.Module):
-    """Compact NeRF MLP: position + view direction → (rgb, sigma).
-
-    Faster to train than ``FastNeRFModel`` at the cost of peak rendering
-    quality.  Recommended for sanity-checks and quick iteration.
+    Parameters
+    ----------
+    n_levels            : Number of resolution levels L (default 16).
+    n_features_per_level: Feature dimensionality per level F (default 2).
+    log2_hashmap_size   : log₂ of the per-level hash table size T (default 19 → 524 288 entries).
+    base_resolution     : Coarsest grid resolution N_min (default 16).
+    max_resolution      : Finest grid resolution N_max (default 2 048).
     """
 
     def __init__(
         self,
-        pos_freq: int = 6,
-        dir_freq: int = 4,
-        hidden_dim: int = 128,
-        num_layers: int = 4,
-    ) -> None:
+        n_levels: int = 16,
+        n_features_per_level: int = 2,
+        log2_hashmap_size: int = 19,
+        base_resolution: int = 16,
+        max_resolution: int = 2048,
+    ):
         super().__init__()
-        self.pos_enc = PositionalEncoding(pos_freq)
-        self.dir_enc = PositionalEncoding(dir_freq)
-        pos_in = self.pos_enc.out_dim(3)
-        dir_in = self.dir_enc.out_dim(3)
+        self.n_levels = n_levels
+        self.n_features_per_level = n_features_per_level
+        self.hashmap_size = 2 ** log2_hashmap_size
+        self.out_dim = n_levels * n_features_per_level
 
-        layers: list[nn.Module] = []
-        in_ch = pos_in
-        for _ in range(num_layers):
-            layers += [nn.Linear(in_ch, hidden_dim), nn.ReLU(inplace=True)]
-            in_ch = hidden_dim
-        self.pos_net = nn.Sequential(*layers)
-        self.sigma_head = nn.Linear(hidden_dim, 1)
-        self.rgb_head = nn.Sequential(
-            nn.Linear(hidden_dim + dir_in, hidden_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim // 2, 3),
+        b = np.exp(np.log(max_resolution / base_resolution) / (n_levels - 1))
+        resolutions = [int(np.floor(base_resolution * (b ** l))) for l in range(n_levels)]
+        self.register_buffer("resolutions", torch.tensor(resolutions, dtype=torch.float32))
+
+        # All 8 trilinear corners as a fixed (8, 3) buffer — avoids realloc each forward
+        corners = torch.tensor(
+            [[dx, dy, dz] for dx in range(2) for dy in range(2) for dz in range(2)],
+            dtype=torch.long,
+        )  # (8, 3)
+        self.register_buffer("corners_offsets", corners)
+
+        # Single stacked embedding (L*T, F) — enables one vectorised lookup for all levels
+        self.stacked_emb = nn.Parameter(
+            torch.empty(n_levels * self.hashmap_size, n_features_per_level).uniform_(-1e-4, 1e-4)
         )
 
-    def forward(
-        self, pts: torch.Tensor, dirs: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        feat = self.pos_net(self.pos_enc(pts))
-        sigma = F.softplus(self.sigma_head(feat))
-        rgb = torch.sigmoid(
-            self.rgb_head(torch.cat([feat, self.dir_enc(dirs)], dim=-1))
+    def forward(self, xyz: torch.Tensor) -> torch.Tensor:
+        """Hash-encode a batch of 3-D positions.
+
+        Parameters
+        ----------
+        xyz : (..., 3) positions in normalised scene space (expected range ≈ [−1, 1]).
+
+        Returns
+        -------
+        (..., out_dim) concatenated multi-resolution features.
+        """
+        L = self.n_levels
+        T = self.hashmap_size
+        F = self.n_features_per_level
+
+        original_shape = xyz.shape[:-1]
+        xyz_flat = xyz.reshape(-1, 3)                          # (N, 3)
+        N = xyz_flat.shape[0]
+        xyz_01 = xyz_flat.clamp(-1.0, 1.0) * 0.5 + 0.5       # (N, 3) → [0, 1]
+
+        # Scale to each level's resolution: (N, L, 3)
+        res = self.resolutions  # (L,) float
+        scaled = xyz_01.unsqueeze(1) * (res.unsqueeze(-1) - 1.0)  # (N, L, 3)
+        xi = scaled.floor().long()    # (N, L, 3) lower-left corner
+        xf = scaled - xi.float()      # (N, L, 3) fractional weights
+
+        # All 8 corners for every point and every level: (N, L, 8, 3)
+        corners = xi.unsqueeze(2) + self.corners_offsets      # (N, L, 8, 3)
+
+        # Spatial hash: XOR of prime-multiplied coordinates, result in [0, T-1]
+        h = corners[..., 0]
+        h = h ^ (corners[..., 1] * 2_654_435_761)
+        h = h ^ (corners[..., 2] * 805_459_861)
+        hash_idx = h & (T - 1)                                # (N, L, 8)
+
+        # Offset by level so each level addresses its own slice of stacked_emb
+        level_offsets = torch.arange(L, device=xyz.device, dtype=torch.long) * T  # (L,)
+        hash_idx = hash_idx + level_offsets.unsqueeze(0).unsqueeze(-1)             # (N, L, 8)
+
+        # Single lookup for all points, levels, and corners (N*L*8, F) → (N, L, 8, F)
+        feat = self.stacked_emb[hash_idx.reshape(-1)].reshape(N, L, 8, F)
+
+        # Trilinear weights — outer product over the three axes: (N, L, 2, 2, 2) → (N, L, 8)
+        wx = torch.stack([1.0 - xf[..., 0], xf[..., 0]], dim=-1)  # (N, L, 2)
+        wy = torch.stack([1.0 - xf[..., 1], xf[..., 1]], dim=-1)
+        wz = torch.stack([1.0 - xf[..., 2], xf[..., 2]], dim=-1)
+        w = wx[..., :, None, None] * wy[..., None, :, None] * wz[..., None, None, :]  # (N, L, 2, 2, 2)
+        w = w.reshape(N, L, 8)                                     # (N, L, 8)
+
+        # Weighted sum over the 8 corners: (N, L, F)
+        feat_interp = (w.unsqueeze(-1) * feat).sum(dim=2)         # (N, L, F)
+
+        return feat_interp.reshape(N, L * F).reshape(*original_shape, self.out_dim)
+
+
+class InstantNGP(nn.Module):
+    """Instant-NGP radiance field  (Müller et al. 2022).
+
+    Drop-in replacement for :class:`NeRF`.  The model owns its multiresolution
+    hash encoding and a compact two-hidden-layer MLP, so **no external
+    positional-encoding functions are needed**.
+
+    Usage with :func:`run_network`
+    ------------------------------
+    Pass ``embed_fn=None`` and ``embeddirs_fn=(lambda x: x)`` so that raw
+    positions (first 3 channels) and raw view directions (last 3 channels) are
+    concatenated and forwarded to this model unchanged.
+
+    Parameters
+    ----------
+    n_levels            : Hash-grid levels L (default 16).
+    n_features_per_level: Features per level F (default 2 → 32-dim hash output).
+    log2_hashmap_size   : log₂ hash table size per level T (default 19).
+    base_resolution     : Coarsest grid resolution N_min (default 16).
+    max_resolution      : Finest grid resolution N_max (default 2 048).
+    geo_hidden          : Hidden width of the geometry MLP (default 64).
+    color_hidden        : Hidden width of the colour MLP (default 64).
+    use_viewdirs        : Condition colour on view direction via 3rd-order SH if True.
+    """
+
+    SH_DIM: int = 16   # (degree 0–3): 1 + 3 + 5 + 7 = 16 coefficients
+
+    def __init__(
+        self,
+        n_levels: int = 16,
+        n_features_per_level: int = 2,
+        log2_hashmap_size: int = 19,
+        base_resolution: int = 16,
+        max_resolution: int = 2048,
+        geo_hidden: int = 64,
+        color_hidden: int = 64,
+        use_viewdirs: bool = True,
+    ):
+        super().__init__()
+        self.use_viewdirs = use_viewdirs
+
+        self.hash_enc = MultiresHashEncoding(
+            n_levels=n_levels,
+            n_features_per_level=n_features_per_level,
+            log2_hashmap_size=log2_hashmap_size,
+            base_resolution=base_resolution,
+            max_resolution=max_resolution,
         )
-        return rgb, sigma
+        hash_dim = self.hash_enc.out_dim   # n_levels * n_features_per_level
+
+        # Geometry network: hash features → raw density + bottleneck feature
+        self.geo_net = nn.Sequential(
+            nn.Linear(hash_dim, geo_hidden),
+            nn.ReLU(),
+            nn.Linear(geo_hidden, 1 + geo_hidden),
+        )
+
+        # Colour network: bottleneck (+ optional SH dirs) → raw RGB
+        dir_dim = self.SH_DIM if use_viewdirs else 0
+        self.color_net = nn.Sequential(
+            nn.Linear(geo_hidden + dir_dim, color_hidden),
+            nn.ReLU(),
+            nn.Linear(color_hidden, 3),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Evaluate the radiance field.
+
+        Parameters
+        ----------
+        x : (N, 3) raw positions, or (N, 6) positions + view directions.
+            Positions occupy the first 3 channels; unit view directions the
+            last 3 channels (only used when ``use_viewdirs=True``).
+
+        Returns
+        -------
+        (N, 4) tensor ``[R, G, B, density_logit]`` – identical layout to
+        :class:`NeRF`, compatible with :func:`raw2outputs`.
+        """
+        pts  = x[..., :3]
+        dirs = x[..., 3:6] if self.use_viewdirs else None
+
+        # Hash-encode positions
+        h = self.hash_enc(pts)                                # (N, hash_dim)
+
+        # Geometry head: raw density + bottleneck feature
+        geo_out = self.geo_net(h)                             # (N, 1 + geo_hidden)
+        sigma   = geo_out[..., :1]                            # raw density logit
+        feat    = geo_out[..., 1:]                            # geometry feature
+
+        # Colour head
+        if self.use_viewdirs and dirs is not None:
+            sh       = sh_encode_directions(F.normalize(dirs, dim=-1))   # (N, 16)
+            color_in = torch.cat([feat, sh], dim=-1)
+        else:
+            color_in = feat
+
+        rgb = self.color_net(color_in)                        # (N, 3)
+        return torch.cat([rgb, sigma], dim=-1)                # (N, 4)
+
+
+def get_instant_ngp(
+    use_viewdirs: bool = True, **kwargs
+) -> Tuple["InstantNGP", None, Optional[object]]:
+    """Create an :class:`InstantNGP` model with matching encode functions.
+
+    Returns
+    -------
+    model        : :class:`InstantNGP` instance.
+    embed_fn     : ``None`` – positions are encoded inside the model.
+    embeddirs_fn : identity ``lambda`` (for raw view dirs) if ``use_viewdirs``, else ``None``.
+    """
+    model = InstantNGP(use_viewdirs=use_viewdirs, **kwargs)
+    embeddirs_fn = (lambda x: x) if use_viewdirs else None
+    return model, None, embeddirs_fn
 
 
 # ---------------------------------------------------------------------------
-# FastNeRFModel – factored position / direction branches (Garbin et al. 2021)
+# FastNeRF  (Garbin et al., ICCV 2021)
 # ---------------------------------------------------------------------------
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding with optional raw-input pass-through."""
+
+    def __init__(self, multires: int, include_input: bool = True) -> None:
+        super().__init__()
+        self.multires = multires
+        self.include_input = include_input
+
+    def out_dim(self, input_dim: int) -> int:
+        base = input_dim if self.include_input else 0
+        return base + input_dim * 2 * self.multires
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rets = [x] if self.include_input else []
+        for i in range(self.multires):
+            rets += [torch.sin(2.0 ** i * x), torch.cos(2.0 ** i * x)]
+        return torch.cat(rets, dim=-1)
+
 
 class FastNeRFModel(nn.Module):
     """Factored NeRF as in *FastNeRF: High-Fidelity Neural Rendering at 200FPS*
@@ -140,6 +469,12 @@ class FastNeRFModel(nn.Module):
     The factorisation allows the position branch outputs to be baked into a
     voxel grid at inference time, reducing per-pixel cost to a cheap lookup
     plus one direction-MLP evaluation → ~200× speedup over vanilla NeRF.
+
+    Usage with :func:`run_network`
+    ------------------------------
+    Pass ``embed_fn=None`` and ``embeddirs_fn=(lambda x: x)`` — identical to
+    :class:`InstantNGP`.  ``run_network`` will concatenate raw xyz + view dirs
+    into a 6-channel vector which this model unpacks internally.
     """
 
     def __init__(
@@ -179,20 +514,25 @@ class FastNeRFModel(nn.Module):
             nn.Linear(64, basis_dim),
         )
 
-    def forward(
-        self, pts: torch.Tensor, dirs: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Evaluate the radiance field.
+
         Parameters
         ----------
-        pts  : (..., 3) world-space sample positions.
-        dirs : (..., 3) **unit** view directions.
+        x : (N, 3) raw positions, or (N, 6) positions + unit view directions.
+            Layout matches :class:`InstantNGP` for compatibility with
+            :func:`run_network` when ``embed_fn=None``.
 
         Returns
         -------
-        rgb   : (..., 3) colour in [0, 1].
-        sigma : (..., 1) non-negative volumetric density.
+        (N, 4) tensor ``[R, G, B, density]`` – identical layout to
+        :class:`NeRF`, compatible with :func:`raw2outputs`.
+        Note: RGB channels are **pre-sigmoid logits**; ``raw2outputs`` applies
+        sigmoid itself.
         """
+        pts  = x[..., :3]
+        dirs = F.normalize(x[..., 3:6], dim=-1) if x.shape[-1] >= 6 else None
+
         pos_enc = self.pos_enc(pts)
         h = pos_enc
         for i, layer in enumerate(self.pos_layers):
@@ -200,201 +540,246 @@ class FastNeRFModel(nn.Module):
             if i + 1 == self.skip_layer:
                 h = torch.cat([h, pos_enc], dim=-1)
 
-        sigma = F.softplus(self.sigma_head(h))                          # (..., 1)
-        basis = self.basis_head(h).view(*pts.shape[:-1], self.basis_dim, 3)  # (..., K, 3)
-        weights = torch.softmax(self.dir_net(self.dir_enc(dirs)), dim=-1)    # (..., K)
-        rgb = torch.sigmoid((weights.unsqueeze(-1) * basis).sum(dim=-2))     # (..., 3)
-        return rgb, sigma
+        sigma = F.softplus(self.sigma_head(h))                               # (N, 1)
+        basis = self.basis_head(h).view(*pts.shape[:-1], self.basis_dim, 3)  # (N, K, 3)
 
+        if dirs is not None:
+            weights = torch.softmax(self.dir_net(self.dir_enc(dirs)), dim=-1)  # (N, K)
+        else:
+            weights = torch.full((*pts.shape[:-1], self.basis_dim), 1.0 / self.basis_dim,
+                                 device=pts.device, dtype=pts.dtype)
+
+        # Pre-sigmoid logits — raw2outputs applies sigmoid to raw[..., :3]
+        rgb_logit = (weights.unsqueeze(-1) * basis).sum(dim=-2)              # (N, 3)
+        return torch.cat([rgb_logit, sigma], dim=-1)                         # (N, 4)
+
+
+def get_fast_nerf(use_viewdirs: bool = True, **kwargs) -> Tuple["FastNeRFModel", None, Optional[object]]:
+    """Create a :class:`FastNeRFModel` with matching encode functions.
+
+    Returns
+    -------
+    model        : :class:`FastNeRFModel` instance.
+    embed_fn     : ``None`` – positions are encoded inside the model.
+    embeddirs_fn : identity ``lambda`` (for raw view dirs) if ``use_viewdirs``, else ``None``.
+    """
+    model = FastNeRFModel(**kwargs)
+    embeddirs_fn = (lambda x: x) if use_viewdirs else None
+    return model, None, embeddirs_fn
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical sampling
+# ---------------------------------------------------------------------------
+
+def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
+    # Get pdf
+    weights = weights + 1e-5 # prevent nans
+    pdf = weights / torch.sum(weights, -1, keepdim=True)
+    cdf = torch.cumsum(pdf, -1)
+    # A zero is prepended to the CDF to handle boundary conditions, ensuring the CDF starts from 0 and ends at 1.
+    cdf = torch.cat([torch.zeros_like(cdf[...,:1]), cdf], -1)  # (batch, len(bins))
+ 
+    # Take uniform samples
+    if det:
+        u = torch.linspace(0., 1., steps=N_samples, device=bins.device)
+        u = u.expand(list(cdf.shape[:-1]) + [N_samples])
+    else:
+        u = torch.rand(list(cdf.shape[:-1]) + [N_samples], device=bins.device)
+ 
+    # Pytest, overwrite u with numpy's fixed random numbers
+    if pytest:
+        np.random.seed(0)
+        new_shape = list(cdf.shape[:-1]) + [N_samples]
+        if det:
+            u = np.linspace(0., 1., N_samples)
+            u = np.broadcast_to(u, new_shape)
+        else:
+            u = np.random.rand(*new_shape)
+        u = torch.Tensor(u)
+ 
+    # Inver CDF
+    u = u.contiguous() # ensures that `u` has contiguous memory layout
+    inds = torch.searchsorted(cdf, u, right=True)
+    below = torch.max(torch.zeros_like(inds-1), inds-1)
+    above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
+    inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
+ 
+    # cdf_g = tf.gather(cdf, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
+    # bins_g = tf.gather(bins, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
+    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
+    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
+    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
+ 
+    denom = (cdf_g[...,1]-cdf_g[...,0])
+    denom = torch.where(denom<1e-5, torch.ones_like(denom), denom)
+    t = (u-cdf_g[...,0])/denom
+    samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
+ 
+    return samples
 
 # ---------------------------------------------------------------------------
 # Volume rendering
 # ---------------------------------------------------------------------------
 
-def volume_render(
-    rgb: torch.Tensor,
-    sigma: torch.Tensor,
-    t_vals: torch.Tensor,
-    rays_d: torch.Tensor,
-    white_bg: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Differentiable alpha compositing (numerical quadrature along a ray).
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
+    """Transforms model's predictions to semantically meaningful values.
+    Args:
+        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+        z_vals: [num_rays, num_samples along ray]. Integration time.
+        rays_d: [num_rays, 3]. Direction of each ray.
+    Returns:
+        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
+        disp_map: [num_rays]. Disparity map. Inverse of depth map.
+        acc_map: [num_rays]. Sum of weights along each ray.
+        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
+        depth_map: [num_rays]. Estimated distance to object.
+    """
+    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
+ 
+    dists = z_vals[...,1:] - z_vals[...,:-1]
+    dists = torch.cat([dists, torch.tensor([1e10], device=z_vals.device).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
+ 
+    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
+ 
+    rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
+    noise = 0.
+    if raw_noise_std > 0.:
+        noise = torch.randn(raw[...,3].shape, device=raw.device) * raw_noise_std
+ 
+        # Overwrite randomly sampled data if pytest
+        if pytest:
+            np.random.seed(0)
+            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
+            noise = torch.Tensor(noise)
+ 
+    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
+    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1), device=alpha.device), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
+ 
+    depth_map = torch.sum(weights * z_vals, -1)
+    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
+    acc_map = torch.sum(weights, -1)
+ 
+    if white_bkgd:
+        rgb_map = rgb_map + (1.-acc_map[...,None])
+ 
+    return rgb_map, disp_map, acc_map, weights, depth_map
+
+
+# ---------------------------------------------------------------------------
+# Network evaluation & volumetric rendering
+# ---------------------------------------------------------------------------
+
+def run_network(model, pts, viewdirs, embed_fn, embeddirs_fn, netchunk=65536):
+    """Evaluate the NeRF MLP on a batch of 3-D points with view directions.
 
     Parameters
     ----------
-    rgb    : (R, S, 3)  per-sample colour.
-    sigma  : (R, S, 1)  per-sample density (non-negative).
-    t_vals : (R, S)     distance of each sample from the ray origin.
-    rays_d : (R, 3)     ray direction vectors (need not be unit vectors;
-                        their norm is used to convert t-steps to world-space).
-    white_bg : composite over a white background if True.
+    model       : NeRF module.
+    pts         : (N_rays, N_samples, 3) sampled points.
+    viewdirs    : (N_rays, 3) unit view directions.
+    embed_fn    : positional-encoding function for xyz.
+    embeddirs_fn: positional-encoding function for view dirs.
+    netchunk    : max points per forward pass (controls GPU memory).
+    """
+    pts_flat = pts.reshape(-1, 3)
+    embedded = embed_fn(pts_flat) if embed_fn is not None else pts_flat
+
+    if embeddirs_fn is not None:
+        dirs_flat = viewdirs[:, None, :].expand_as(pts).reshape(-1, 3)
+        embedded_dirs = embeddirs_fn(dirs_flat)
+        embedded = torch.cat([embedded, embedded_dirs], dim=-1)
+
+    outputs = []
+    for i in range(0, embedded.shape[0], netchunk):
+        outputs.append(model(embedded[i:i + netchunk]))
+    raw = torch.cat(outputs, dim=0)
+    return raw.reshape(list(pts.shape[:-1]) + [raw.shape[-1]])
+
+
+def render_rays(
+    model,
+    rays_o,
+    rays_d,
+    near,
+    far,
+    N_samples,
+    N_importance=0,
+    model_fine=None,
+    embed_fn=None,
+    embeddirs_fn=None,
+    rand=True,
+    white_bkgd=False,
+    raw_noise_std=0.0,
+    netchunk=65536,
+):
+    """Full volumetric rendering pipeline (coarse + optional hierarchical fine).
 
     Returns
     -------
-    colour   : (R, 3)
-    disp_map : (R,)   disparity map (inverse of depth, weighted by acc).
-    acc_map  : (R,)   accumulated opacity along each ray.
-    weights  : (R, S) useful for importance sampling.
-    depth    : (R,)   expected depth along each ray.
+    dict with keys:
+        rgb_map   – (N_rays, 3)
+        depth_map – (N_rays,)
+        acc_map   – (N_rays,)
+        disp_map  – (N_rays,)
+    If *N_importance* > 0 the dict also contains ``rgb_map_coarse``.
     """
-    # Step sizes in t-space; treat the last step as infinite
-    dists = t_vals[..., 1:] - t_vals[..., :-1]                              # (R, S-1)
-    dists = torch.cat([dists, torch.full_like(dists[..., :1], 1e10)], dim=-1)  # (R, S)
-    # Scale by ray magnitude → actual world-space step lengths
-    dists = dists * rays_d.norm(dim=-1, keepdim=True)                       # (R, S)
+    N_rays = rays_o.shape[0]
+    device = rays_o.device
 
-    alpha = 1.0 - torch.exp(-F.relu(sigma[..., 0]) * dists)                # (R, S)
+    # ---- stratified sampling along each ray --------------------------------
+    t_vals = torch.linspace(0.0, 1.0, steps=N_samples, device=device)
+    z_vals = near * (1.0 - t_vals) + far * t_vals
+    z_vals = z_vals.expand(N_rays, N_samples)
 
-    # Transmittance: T_i = ∏_{j<i}(1 – α_j)
-    T = torch.cumprod(
-        torch.cat([torch.ones_like(alpha[..., :1]), 1.0 - alpha + 1e-10], dim=-1),
-        dim=-1,
-    )[..., :-1]                                                             # (R, S)
+    if rand:
+        mids = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        upper = torch.cat([mids, z_vals[..., -1:]], dim=-1)
+        lower = torch.cat([z_vals[..., :1], mids], dim=-1)
+        z_vals = lower + (upper - lower) * torch.rand(z_vals.shape, device=device)
 
-    weights = T * alpha                                                     # (R, S)
-    colour = (weights.unsqueeze(-1) * rgb).sum(dim=-2)                     # (R, 3)
-    depth = (weights * t_vals).sum(dim=-1)                                 # (R,)
-    acc_map = weights.sum(dim=-1)                                          # (R,)
-    disp_map = 1.0 / torch.max(
-        1e-10 * torch.ones_like(depth), depth / acc_map.clamp(min=1e-10)
-    )                                                                      # (R,)
+    pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]
+    viewdirs = F.normalize(rays_d, dim=-1)
 
-    if white_bg:
-        colour = colour + (1.0 - acc_map.unsqueeze(-1))
-
-    return colour, disp_map, acc_map, weights, depth
-
-
-# ---------------------------------------------------------------------------
-# Ray sampling
-# ---------------------------------------------------------------------------
-
-def sample_stratified(
-    near: float,
-    far: float,
-    n_samples: int,
-    n_rays: int,
-    device: torch.device,
-    perturb: bool = True,
-) -> torch.Tensor:
-    """Jittered stratified sampling in [near, far].
-
-    Returns
-    -------
-    t_vals : (n_rays, n_samples)
-    """
-    t = torch.linspace(near, far, n_samples, device=device).expand(n_rays, n_samples)
-    if perturb:
-        mid = 0.5 * (t[..., 1:] + t[..., :-1])
-        upper = torch.cat([mid, t[..., -1:]], dim=-1)
-        lower = torch.cat([t[..., :1], mid], dim=-1)
-        t = lower + (upper - lower) * torch.rand_like(t)
-    return t
-
-
-def sample_pdf(
-    bins: torch.Tensor,
-    weights: torch.Tensor,
-    n_samples: int,
-    perturb: bool = True,
-) -> torch.Tensor:
-    """Inverse-CDF importance sampling for hierarchical NeRF.
-
-    Parameters
-    ----------
-    bins      : (R, W) – midpoints of W bins.  Typically the midpoints of
-                consecutive coarse t-values, smoothed with neighbour weights.
-    weights   : (R, W) – un-normalised non-negative importance weights.
-                Must have the **same** last dimension as ``bins``.
-    n_samples : number of fine samples to draw per ray.
-
-    Returns
-    -------
-    samples : (R, n_samples) new t-values drawn from the implied distribution.
-
-    Notes
-    -----
-    Linear interpolation between neighbouring bin centres is used within each
-    CDF interval, matching the standard nerf-pytorch convention.
-    """
-    w = weights.clamp(min=0.0) + 1e-5
-    pdf = w / w.sum(dim=-1, keepdim=True)                                # (R, W)
-    cdf = torch.cat(
-        [torch.zeros_like(pdf[..., :1]), torch.cumsum(pdf, dim=-1)],
-        dim=-1,
-    )                                                                    # (R, W+1)
-
-    if perturb:
-        u = torch.rand(*bins.shape[:-1], n_samples, device=bins.device)
-    else:
-        u = torch.linspace(0.0, 1.0, n_samples, device=bins.device).expand(
-            *bins.shape[:-1], n_samples
-        )
-    u = u.contiguous()
-
-    # Binary search: for each u find the interval.  inds ∈ [0, W].
-    inds = torch.searchsorted(cdf, u, right=True)                       # (R, F)
-
-    # Left index ∈ [0, W-2], right = left+1 ∈ [1, W-1]
-    lo = (inds - 1).clamp(0, bins.shape[-1] - 2)                       # (R, F)
-    hi = lo + 1                                                         # (R, F)
-
-    bins_lo = torch.gather(bins, -1, lo)                                # (R, F)
-    bins_hi = torch.gather(bins, -1, hi)                                # (R, F)
-    cdf_lo  = torch.gather(cdf,  -1, lo)                               # (R, F)
-    cdf_hi  = torch.gather(cdf,  -1, hi)                               # (R, F)
-
-    denom = (cdf_hi - cdf_lo).clamp(min=1e-5)
-    t = ((u - cdf_lo) / denom).clamp(0.0, 1.0)
-    return bins_lo + t * (bins_hi - bins_lo)
-
-
-# ---------------------------------------------------------------------------
-# Ray generation
-# ---------------------------------------------------------------------------
-
-def get_rays(
-    H: int,
-    W: int,
-    K: torch.Tensor,
-    c2w: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate per-pixel rays for one image.
-
-    Parameters
-    ----------
-    H, W : image height and width.
-    K    : (3, 3) intrinsic matrix  ``[fx, 0, cx; 0, fy, cy; 0, 0, 1]``.
-    c2w  : (4, 4) camera-to-world matrix produced by ``colmap_to_c2w``.
-
-    Returns
-    -------
-    rays_o : (H, W, 3) ray origins  (= camera centre, tiled over all pixels).
-    rays_d : (H, W, 3) ray directions in world space (not unit-normalised).
-
-    Notes
-    -----
-    COLMAP uses +X right, +Y down, +Z into the scene.  NeRF / OpenGL uses
-    +X right, +Y **up**, −Z into the scene.  The conversion is applied here
-    by negating the Y and Z pixel-direction components before rotating to
-    world space, so the rest of the pipeline uses NeRF conventions throughout.
-    """
-    device = c2w.device
-    j, i = torch.meshgrid(
-        torch.arange(H, dtype=torch.float32, device=device),
-        torch.arange(W, dtype=torch.float32, device=device),
-        indexing="ij",
+    # ---- coarse network ----------------------------------------------------
+    raw = run_network(model, pts, viewdirs, embed_fn, embeddirs_fn, netchunk)
+    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
+        raw, z_vals, rays_d, raw_noise_std, white_bkgd,
     )
-    # Pixel directions in COLMAP camera space  (+Z forward)
-    dx = (i - K[0, 2]) / K[0, 0]
-    dy = (j - K[1, 2]) / K[1, 1]
-    # Flip Y and Z → NeRF/OpenGL convention  (−Z forward, +Y up)
-    dirs = torch.stack([dx, -dy, -torch.ones_like(dx)], dim=-1)         # (H, W, 3)
 
-    # Rotate to world space
-    rays_d = (dirs[..., None, :] * c2w[:3, :3]).sum(dim=-1)            # (H, W, 3)
-    rays_o = c2w[:3, 3].expand_as(rays_d)                              # (H, W, 3)
-    return rays_o, rays_d
+    ret = {
+        "rgb_map": rgb_map,
+        "disp_map": disp_map,
+        "acc_map": acc_map,
+        "depth_map": depth_map,
+    }
+
+    # ---- hierarchical (fine) sampling --------------------------------------
+    if N_importance > 0:
+        fine_model = model_fine if model_fine is not None else model
+
+        z_vals_mid = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        z_samples = sample_pdf(
+            z_vals_mid, weights[..., 1:-1], N_importance, det=(not rand),
+        )
+        z_samples = z_samples.detach()
+        z_vals_fine, _ = torch.sort(torch.cat([z_vals, z_samples], dim=-1), dim=-1)
+
+        pts_fine = rays_o[..., None, :] + rays_d[..., None, :] * z_vals_fine[..., :, None]
+        raw_fine = run_network(fine_model, pts_fine, viewdirs, embed_fn, embeddirs_fn, netchunk)
+        rgb_fine, disp_fine, acc_fine, _, depth_fine = raw2outputs(
+            raw_fine, z_vals_fine, rays_d, raw_noise_std, white_bkgd,
+        )
+
+        ret["rgb_map_coarse"] = rgb_map
+        ret["rgb_map"] = rgb_fine
+        ret["disp_map"] = disp_fine
+        ret["acc_map"] = acc_fine
+        ret["depth_map"] = depth_fine
+
+    return ret
 
 
 # ---------------------------------------------------------------------------
@@ -610,136 +995,44 @@ class ColmapNeRFDataset:
         idx = torch.randint(0, self.rays_o.shape[0], (batch_size,), device=self.device)
         return self.rays_o[idx], self.rays_d[idx], self.targets[idx]
 
+    def __len__(self) -> int:
+        return self.N
+
+    def __getitem__(self, idx: int):
+        """Return ``(image, c2w, K)`` for image *idx*."""
+        return self.images[idx], self.c2w[idx], self.K[idx]
 
 # ---------------------------------------------------------------------------
-# Full-image rendering
+# Visualization
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def render_image(
-    model: nn.Module,
-    H: int,
-    W: int,
-    K: torch.Tensor,
-    c2w: torch.Tensor,
-    near: float,
-    far: float,
-    n_coarse: int = 64,
-    n_fine: int = 64,
-    chunk: int = 2048,
-    white_bg: bool = True,
-    device: str = "cpu",
-    coarse_model: Optional[nn.Module] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Render a full H×W image from a trained NeRF model.
+def trans_t(t):
+    return torch.tensor([
+        [1,0,0,0],
+        [0,1,0,0],
+        [0,0,1,t],
+        [0,0,0,1]
+    ], dtype=torch.float32)
 
-    Processes rays in batches of *chunk* to prevent OOM errors.
+def rot_phi(phi):
+    return torch.tensor([
+        [1,0,0,0],
+        [0,np.cos(phi),-np.sin(phi),0],
+        [0,np.sin(phi), np.cos(phi),0],
+        [0,0,0,1]
+    ], dtype=torch.float32)
 
-    Parameters
-    ----------
-    model        : Fine (or only) NeRF model.
-    coarse_model : When provided, hierarchical importance sampling is used:
-                   coarse weights guide fine sample placement for higher quality.
-    n_coarse     : Number of stratified samples per ray (coarse pass).
-    n_fine       : Number of importance-sampled points added in the fine pass
-                   (only used when ``coarse_model`` is not None).
-    chunk        : Number of rays processed in one forward pass.
+def rot_theta(th):
+    return torch.tensor([
+        [np.cos(th),0,-np.sin(th),0],
+        [0,1,0,0],
+        [np.sin(th),0,np.cos(th),0],
+        [0,0,0,1]
+    ], dtype=torch.float32)
 
-    Returns
-    -------
-    rgb_img   : (H, W, 3) float32 in [0, 1].
-    depth_img : (H, W)    float32 (normalised scene units).
-    disp_img  : (H, W)    float32 disparity map.
-    acc_img   : (H, W)    float32 accumulated opacity in [0, 1].
-    """
-    model.eval()
-    if coarse_model is not None:
-        coarse_model.eval()
-
-    rays_o, rays_d = get_rays(H, W, K, c2w.to(device))
-    rays_o = rays_o.reshape(-1, 3)
-    rays_d = rays_d.reshape(-1, 3)
-
-    rgb_chunks, depth_chunks, disp_chunks, acc_chunks = [], [], [], []
-    for start in range(0, rays_o.shape[0], chunk):
-        ro = rays_o[start : start + chunk]
-        rd = rays_d[start : start + chunk]
-        B  = ro.shape[0]
-
-        # ── Coarse pass ──────────────────────────────────────────────────────
-        t_c  = sample_stratified(near, far, n_coarse, B, device=device,
-                                 perturb=False)                          # (B, Sc)
-        pts  = ro[:, None] + rd[:, None] * t_c[..., None]                # (B, Sc, 3)
-        d_n  = F.normalize(rd, dim=-1)[:, None].expand_as(pts)           # (B, Sc, 3)
-        src  = coarse_model if coarse_model is not None else model
-        rgb_c, sig_c = src(pts.reshape(-1, 3), d_n.reshape(-1, 3))
-        rgb_c = rgb_c.reshape(B, n_coarse, 3)
-        sig_c = sig_c.reshape(B, n_coarse, 1)
-
-        if coarse_model is not None and n_fine > 0:
-            # ── Fine pass (hierarchical importance sampling) ─────────────────
-            _, _, _, w_c, _ = volume_render(rgb_c, sig_c, t_c, rd, white_bg=white_bg)
-            t_mid  = 0.5 * (t_c[..., 1:] + t_c[..., :-1])               # (B, Sc-1)
-            w_mid  = 0.5 * (w_c[..., :-1] + w_c[..., 1:])               # (B, Sc-1)
-            t_f    = sample_pdf(t_mid, w_mid, n_fine, perturb=False)     # (B, Sf)
-            t_all, _ = torch.sort(torch.cat([t_c, t_f], dim=-1), dim=-1)
-            pts_f  = ro[:, None] + rd[:, None] * t_all[..., None]
-            d_nf   = F.normalize(rd, dim=-1)[:, None].expand_as(pts_f)
-            rgb_c, sig_c = model(pts_f.reshape(-1, 3), d_nf.reshape(-1, 3))
-            rgb_c  = rgb_c.reshape(B, -1, 3)
-            sig_c  = sig_c.reshape(B, -1, 1)
-            t_c    = t_all
-
-        colour, disp, acc, _, depth = volume_render(rgb_c, sig_c, t_c, rd, white_bg=white_bg)
-        rgb_chunks.append(colour.cpu())
-        depth_chunks.append(depth.cpu())
-        disp_chunks.append(disp.cpu())
-        acc_chunks.append(acc.cpu())
-
-    rgb_img   = torch.cat(rgb_chunks).reshape(H, W, 3).numpy()
-    depth_img = torch.cat(depth_chunks).reshape(H, W).numpy()
-    disp_img  = torch.cat(disp_chunks).reshape(H, W).numpy()
-    acc_img   = torch.cat(acc_chunks).reshape(H, W).numpy()
-    return (
-        rgb_img.clip(0.0, 1.0).astype(np.float32),
-        depth_img.astype(np.float32),
-        disp_img.astype(np.float32),
-        acc_img.astype(np.float32),
-    )
-
-
-def visualize_depth(
-    depth: np.ndarray,
-    acc: np.ndarray,
-    acc_threshold: float = 0.1,
-    lo_pct: float = 2.0,
-    hi_pct: float = 98.0,
-) -> np.ndarray:
-    """Produce a clean uint8 depth visualisation.
-
-    Masks out low-opacity pixels (where the model is uncertain) and uses
-    percentile-based normalisation to avoid outlier-driven scaling.
-
-    Parameters
-    ----------
-    depth : (H, W) raw depth map.
-    acc   : (H, W) accumulated opacity in [0, 1].
-    acc_threshold : pixels with acc below this are treated as background.
-    lo_pct, hi_pct : percentile range for normalisation (applied to
-        foreground pixels only).
-
-    Returns
-    -------
-    vis : (H, W) uint8 image suitable for saving as PNG.
-    """
-    valid = acc > acc_threshold
-    if valid.sum() < 10:
-        # Not enough valid pixels — fall back to uniform grey
-        return np.full(depth.shape, 128, dtype=np.uint8)
-    d_valid = depth[valid]
-    lo = float(np.percentile(d_valid, lo_pct))
-    hi = float(np.percentile(d_valid, hi_pct))
-    d_norm = np.clip((depth - lo) / (hi - lo + 1e-8), 0.0, 1.0)
-    # Background → white (1.0)
-    d_norm[~valid] = 1.0
-    return (d_norm * 255).astype(np.uint8)
+def pose_spherical(theta, phi, radius):
+    c2w = trans_t(radius)
+    c2w = rot_phi(phi/180.*np.pi) @ c2w
+    c2w = rot_theta(theta/180.*np.pi) @ c2w
+    c2w = torch.tensor([[-1,0,0,0],[0,0,1,0],[0,1,0,0],[0,0,0,1]], dtype=torch.float32) @ c2w
+    return c2w

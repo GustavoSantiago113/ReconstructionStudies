@@ -221,17 +221,29 @@ def sample_pdf(bins, weights, n_samples, det=False):
     u = u.contiguous()
 
     inds = torch.searchsorted(cdf, u, right=True)
-    below = torch.clamp(inds - 1, min=0)
-    above = torch.clamp(inds, max=cdf.shape[-1] - 1)
+    below = torch.max(torch.zeros_like(inds-1), inds-1)
+    above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
 
     inds_g = torch.stack([below, above], dim=-1)  # (N, n_samples, 2)
-    cdf_g = torch.gather(cdf, -1, inds_g.reshape(*cdf.shape[:-1], -1)).reshape(*inds_g.shape)
+    
+    """ cdf_g = torch.gather(cdf, -1, inds_g.reshape(*cdf.shape[:-1], -1)).reshape(*inds_g.shape)
     bins_g = torch.gather(bins, -1, inds_g.reshape(*bins.shape[:-1], -1)).reshape(*inds_g.shape)
 
     denom = cdf_g[..., 1] - cdf_g[..., 0]
     denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
     t = (u - cdf_g[..., 0]) / denom
     samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
+    return samples """
+
+    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
+    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
+    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
+
+    denom = (cdf_g[...,1]-cdf_g[...,0])
+    denom = torch.where(denom<1e-5, torch.ones_like(denom), denom)
+    t = (u-cdf_g[...,0])/denom
+    samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
+
     return samples
 
 
@@ -348,8 +360,8 @@ class SimpleNeRFTrainer:
         rays_d = torch.sum(dirs[..., None, :] * pose[:3, :3], dim=-1)
         
         # Origin is the camera position
-        rays_o = pose[:3, 3].expand(rays_d.shape)
-        
+        #rays_o = pose[:3, 3].expand(rays_d.shape)
+        rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
         return rays_o, rays_d
     
     def render_rays(self, rays_o, rays_d, near=None, far=None, n_samples=64, n_importance=64):

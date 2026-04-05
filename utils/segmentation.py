@@ -79,37 +79,6 @@ class ImageSegmenter:
             model = UNet(in_channels=3, out_channels=1, channels=channels, 
                         bilinear=True, use_batchnorm=True)
         
-        elif self.model_type == "DeepLabV3Plus":
-            from utils.models.deeplabv3p import DeepLabV3Plus
-            model = DeepLabV3Plus(num_classes=1, output_stride=16, backbone_width_mult=1.0)
-        
-        elif self.model_type == "SegFormer":
-            from utils.models.SegFormer import segformer
-            model = segformer(in_channels=3, num_classes=1)
-        
-        elif self.model_type == "SegNet":
-            from utils.models.SegNet import segnet
-            model = segnet(in_channels=3, num_classes=1, pretrained=False)
-        
-        elif self.model_type == "MaskFormer":
-            from utils.models.maskFormer import MaskFormer
-            from utils.models.resnet101 import resnet101_backbone
-            
-            resnet101 = resnet101_backbone()
-            model = MaskFormer(
-                backbone=resnet101,
-                num_classes=1,
-                num_queries=5,
-                embed_dim=64,
-                transformer_layers=1,
-                transformer_heads=2,
-                transformer_ffn_dim=256,
-                return_binary=True
-            )
-        
-        else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
-        
         # Load weights
         model.load_state_dict(torch.load(self.model_path, map_location=self.device))
         model.to(self.device)

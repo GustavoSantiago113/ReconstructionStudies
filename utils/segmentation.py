@@ -1,336 +1,532 @@
 """
-Image Segmentation Module for Transparent Background Generation
+Interactive per-image SAM2 folder segmentation
 
-This module applies trained segmentation models to create PNG images with transparent backgrounds.
+Workflow (per image)
+  1. Draw a bounding box around the object (click-and-drag).
+  2. SAM2 predicts the segmentation mask inside that box.
+  3. A polygon editor opens — drag any vertex to refine the boundary,
+     then close the window to confirm.
+  4. A side-by-side preview shows the original and the white-background result.
+     Respond in the terminal:
+       [s] save result and move to the next image
+       [r] redo this image from the bounding-box step
+       [t] tune mask_threshold / iou_threshold for this session
+       [q] quit  (run again to resume from where you stopped)
+
+Resume support
+  Already-saved images in --output_dir are detected and skipped automatically.
+
+Prerequisites
+  pip install git+https://github.com/facebookresearch/sam2.git
+
+How to run (from repository root)
+  python utils/segmentation.py \
+    --input_dir  data/images/miniature \
+    --output_dir data/images/miniature_segmented \
+    --sam_checkpoint models/sam2.1_hiera_large.pt
+
+  The SAM2 config is auto-detected from the checkpoint filename.
+  Override with --sam_config if needed, e.g.:
+    --sam_config configs/sam2.1/sam2.1_hiera_l.yaml
+
+Parameter guidance
+  mask_threshold  default 0.0 (= 50% probability logit boundary).
+                  Decrease to expand mask coverage; increase to shrink it.
+  iou_threshold   default 0.3. Lower values accept lower-confidence candidates.
+
+Outputs
+    Segmented PNGs with a transparent background saved to --output_dir.
 """
 
-import os
-import torch
+from pathlib import Path
+from typing import Optional, Tuple
+import contextlib
 import numpy as np
 from PIL import Image
-import torchvision.transforms.functional as TF
-from pathlib import Path
-from typing import Optional, List
-import sys
+import matplotlib.pyplot as plt
 import cv2
+import torch
+import argparse
 
-# Add parent directory to path to import models
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor as _SAM2ImagePredictor
+    _SAM2_AVAILABLE = True
+except Exception:
+    _SAM2_AVAILABLE = False
 
-class ImageSegmenter:
-    def create_transparent_image(self, image: Image.Image, mask: np.ndarray) -> Image.Image:
+# Maps checkpoint stem substrings to the SAM2 config (relative to sam2/configs/)
+_SAM2_CONFIG_MAP = {
+    "sam2.1_hiera_large":     "configs/sam2.1/sam2.1_hiera_l.yaml",
+    "sam2.1_hiera_base_plus": "configs/sam2.1/sam2.1_hiera_b+.yaml",
+    "sam2.1_hiera_small":     "configs/sam2.1/sam2.1_hiera_s.yaml",
+    "sam2.1_hiera_tiny":      "configs/sam2.1/sam2.1_hiera_t.yaml",
+    "sam2_hiera_large":       "configs/sam2/sam2_hiera_l.yaml",
+    "sam2_hiera_base_plus":   "configs/sam2/sam2_hiera_b+.yaml",
+    "sam2_hiera_small":       "configs/sam2/sam2_hiera_s.yaml",
+    "sam2_hiera_tiny":        "configs/sam2/sam2_hiera_t.yaml",
+}
+
+
+def _auto_detect_config(checkpoint_path: str) -> str:
+    stem = Path(checkpoint_path).stem
+    for key, cfg in _SAM2_CONFIG_MAP.items():
+        if key in stem:
+            return cfg
+    raise ValueError(
+        f"Cannot auto-detect SAM2 config from '{stem}'. "
+        f"Pass --sam_config explicitly (e.g. configs/sam2.1/sam2.1_hiera_l.yaml)."
+    )
+
+
+class SamFolderSegmenter:
+    def __init__(self, device: Optional[str] = None):
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+
+    @contextlib.contextmanager
+    def _infer_ctx(self):
+        """No-grad + bfloat16 autocast on CUDA, plain no-grad on CPU."""
+        if self.device == "cuda":
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                yield
+        else:
+            with torch.inference_mode():
+                yield
+
+    def _load_sam(self, checkpoint: str, sam_config: Optional[str] = None):
+        if not _SAM2_AVAILABLE:
+            raise RuntimeError(
+                "sam2 is not installed. Install it with:\n"
+                "  pip install git+https://github.com/facebookresearch/sam2.git"
+            )
+        if sam_config is None:
+            sam_config = _auto_detect_config(checkpoint)
+        print(f"Loading SAM2 — config: {sam_config}")
+        sam2 = build_sam2(sam_config, str(checkpoint), device=self.device)
+        return _SAM2ImagePredictor(sam2)
+
+    def _set_image(self, predictor, image_np: np.ndarray):
+        """Encode image features (cached until next call)."""
+        with self._infer_ctx():
+            predictor.set_image(image_np)
+
+    def _get_box_from_user(self, pil_img: Image.Image) -> Tuple[int, int, int, int]:
+        """Show the image; user clicks and drags to draw a rectangle. Returns (x1, y1, x2, y2).
+
+        Close the window after drawing to confirm the selection.
         """
-        Create RGBA image with transparent background (mask=0 is transparent).
-        Args:
-            image: Original RGB image
-            mask: Binary segmentation mask
-        Returns:
-            RGBA image with transparency
+        from matplotlib.patches import Rectangle as MplRect
+
+        box: list = [None]
+        start: list = [None]
+        rect_patch: list = [None]
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.imshow(pil_img)
+        ax.set_title("Click and drag to draw a bounding box, then close this window", fontsize=11)
+        ax.axis('off')
+
+        def on_press(event):
+            if event.inaxes is not ax or event.button != 1:
+                return
+            start[0] = (event.xdata, event.ydata)
+            if rect_patch[0] is not None:
+                rect_patch[0].remove()
+                rect_patch[0] = None
+            fig.canvas.draw_idle()
+
+        def on_motion(event):
+            if start[0] is None or event.inaxes is not ax:
+                return
+            x0, y0 = start[0]
+            x1 = event.xdata if event.xdata is not None else x0
+            y1 = event.ydata if event.ydata is not None else y0
+            if rect_patch[0] is not None:
+                rect_patch[0].remove()
+            rect_patch[0] = ax.add_patch(MplRect(
+                (min(x0, x1), min(y0, y1)), abs(x1 - x0), abs(y1 - y0),
+                linewidth=2, edgecolor='lime', facecolor='none'
+            ))
+            fig.canvas.draw_idle()
+
+        def on_release(event):
+            if start[0] is None or event.button != 1:
+                return
+            x0, y0 = start[0]
+            x1 = event.xdata if event.xdata is not None else x0
+            y1 = event.ydata if event.ydata is not None else y0
+            box[0] = (int(min(x0, x1)), int(min(y0, y1)),
+                      int(max(x0, x1)), int(max(y0, y1)))
+            ax.set_title(f"Box confirmed: {box[0]}  —  close this window to continue", fontsize=10)
+            start[0] = None
+            fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect('button_press_event', on_press)
+        fig.canvas.mpl_connect('motion_notify_event', on_motion)
+        fig.canvas.mpl_connect('button_release_event', on_release)
+
+        plt.show()
+
+        if box[0] is None:
+            raise RuntimeError("No rectangle drawn. Please draw a bounding box around the object.")
+        print(f"Box selected: {box[0]}")
+        return box[0]
+
+    def _predict_sam_mask(self, predictor, box: Tuple[int, int, int, int],
+                          mask_threshold: float = 0.0,
+                          iou_threshold: float = 0.3) -> np.ndarray:
+        """Predict mask from already-set image features using a bounding box prompt.
+
+        mask_threshold: SAM2 logit threshold (0.0 == 50 % probability);
+            lower = larger/more inclusive mask.
+        iou_threshold: minimum predicted IoU to accept a mask candidate.
         """
-        image = image.convert('RGB')
-        arr = np.array(image)
+        predictor.mask_threshold = mask_threshold
+        with self._infer_ctx():
+            masks, scores, _ = predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=np.array([box[0], box[1], box[2], box[3]]),
+                multimask_output=True,
+            )
+        valid = scores >= iou_threshold
+        best_idx = int(np.argmax(scores * valid)) if valid.any() else int(np.argmax(scores))
+        return masks[best_idx].astype(np.uint8)
+
+    def _show_overlay(self, pil_img: Image.Image, mask: np.ndarray,
+                      box: Optional[Tuple[int, int, int, int]] = None,
+                      title: str = "Preview"):
+        from matplotlib.patches import Rectangle
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(pil_img)
+        overlay = np.zeros((mask.shape[0], mask.shape[1], 4), dtype=np.uint8)
+        overlay[..., 0] = 255
+        overlay[..., 3] = (mask * 120).astype(np.uint8)
+        ax.imshow(overlay)
+        if box is not None:
+            x1, y1, x2, y2 = box
+            ax.add_patch(Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                   linewidth=2, edgecolor='lime', facecolor='none'))
+        ax.axis('off')
+        fig.canvas.manager.set_window_title(title)
+        plt.show()
+
+    def _refine_mask(self, mask: np.ndarray, kernel_size: int = 5) -> np.ndarray:
+        if kernel_size <= 1:
+            return mask
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+        mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+        return (mask > 0).astype(np.uint8)
+
+    def _apply_mask_white_bg(self, pil_img: Image.Image, mask: np.ndarray) -> Image.Image:
+        # Produce an RGBA image where masked area keeps original colors
+        # and background is transparent.
+        img = pil_img.convert('RGB')
+        arr = np.array(img)
+        # If mask and image sizes do not match, resize mask to image size
         if mask.shape != arr.shape[:2]:
             from PIL import Image as PILImage
             mask_img = PILImage.fromarray((mask * 255).astype(np.uint8))
             mask_img = mask_img.resize((arr.shape[1], arr.shape[0]), Image.BILINEAR)
             mask = (np.array(mask_img) / 255.0 > 0.5).astype(np.uint8)
-        # Zero out RGB where mask==0 to ensure background is transparent black
-        arr = arr * mask[..., None]
         alpha = (mask * 255).astype(np.uint8)
         rgba = np.dstack([arr, alpha])
         return Image.fromarray(rgba, mode='RGBA')
-    
-    """
-    Segments images using trained models and generates transparent backgrounds.
-    """
-    
-    def __init__(self, model_path: str, model_type: str = "U-NET", device: Optional[str] = None):
+
+    # ------------------------------------------------------------------
+    # Polygon helpers
+    # ------------------------------------------------------------------
+
+    def _mask_to_polygon(self, mask: np.ndarray, max_pts: int = 400) -> Optional[np.ndarray]:
+        """Extract the largest contour from mask and resample it to a smooth polygon.
+
+        This returns an Nx2 float array of (x, y) coordinates, or None if no contour.
+        The contour is resampled to up to `max_pts` points uniformly along arc-length
+        and smoothed with a small moving-average to produce a smoother polygon.
         """
-        Initialize the segmenter.
-        
-        Args:
-            model_path: Path to trained segmentation model
-            model_type: Type of model ("U-NET", "DeepLabV3Plus", "SegFormer", "SegNet", "MaskFormer")
-            device: Device to use ("cuda" or "cpu"). Auto-detected if None.
-        """
-        self.model_path = Path(model_path)
-        self.model_type = model_type
-        
-        # Setup device
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(device)
-        
-        print(f"Using device: {self.device}")
-        
-        # Load model
-        self.model = self._load_model()
-        self.model.eval()
-        
-        print(f"✓ Loaded {model_type} model from {model_path}")
-    
-    def _load_model(self):
-        """Load the appropriate model architecture and weights"""
-        
-        if self.model_type == "U-NET":
-            from utils.models.uNet import UNet
-            channels = [32, 64, 128, 256, 512]
-            model = UNet(in_channels=3, out_channels=1, channels=channels, 
-                        bilinear=True, use_batchnorm=True)
-        
-        # Load weights
-        model.load_state_dict(torch.load(self.model_path, map_location=self.device))
-        model.to(self.device)
-        
-        return model
-    
-    def preprocess_image(self, image: Image.Image) -> torch.Tensor:
-        """
-        Preprocess image for model input.
-        
-        Args:
-            image: PIL Image in RGB format
-            
-        Returns:
-            Preprocessed tensor [1, 3, H, W]
-        """
-        # Convert to tensor
-        img_tensor = TF.to_tensor(image)
-        
-        # Normalize
-        img_tensor = TF.normalize(img_tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        
-        # Add batch dimension
-        img_tensor = img_tensor.unsqueeze(0)
-        
-        return img_tensor.to(self.device)
-    
-    def predict_mask(self, image: Image.Image, threshold: float = 0.5, use_contours: bool = True) -> np.ndarray:
-        """
-        Predict segmentation mask for an image using contour-based approach.
-        
-        Args:
-            image: PIL Image in RGB format
-            threshold: Threshold for binary segmentation (default: 0.5)
-            use_contours: Use contour-based refinement (default: True)
-            
-        Returns:
-            Binary mask as numpy array [H, W]
-        """
-        # Convert PIL to cv2 format
-        image_cv2 = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-        h_orig, w_orig = image_cv2.shape[:2]
-        
-        # Resize to 512x512 for model
-        image_resized = cv2.resize(image_cv2, (512, 512), interpolation=cv2.INTER_LINEAR)
-        image_rgb = cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB)
-        image_tensor = TF.to_tensor(image_rgb)
-        image_tensor = TF.normalize(image_tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        image_tensor = image_tensor.unsqueeze(0).to(self.device)
-        
-        # Predict
-        with torch.no_grad():
-            with torch.amp.autocast('cuda'):
-                pred_logits = self.model(image_tensor)
-                pred_mask = (torch.sigmoid(pred_logits) > threshold).float().cpu().squeeze().numpy()
-        
-        if use_contours:
-            # Find contours on mask (512x512)
-            mask_uint8 = (pred_mask * 255).astype(np.uint8)
-            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Upscale contours to original image size
-            scale_x = w_orig / 512.0
-            scale_y = h_orig / 512.0
-            upscaled_contours = [np.array([[int(pt[0][0]*scale_x), int(pt[0][1]*scale_y)] for pt in contour], dtype=np.int32) for contour in contours]
-            
-            # Create mask for original image
-            mask_orig = np.zeros((h_orig, w_orig), dtype=np.uint8)
-            cv2.drawContours(mask_orig, upscaled_contours, -1, 255, thickness=cv2.FILLED)
-            mask = (mask_orig / 255.0).astype(np.uint8)
-        else:
-            # Simple resize approach
-            mask_img = Image.fromarray((pred_mask * 255).astype(np.uint8))
-            mask_img = mask_img.resize((w_orig, h_orig), Image.BILINEAR)
-            mask = (np.array(mask_img) / 255.0 > threshold).astype(np.uint8)
-        
+        contours, _ = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
+        if not contours:
+            return None
+        contour = max(contours, key=cv2.contourArea)
+        contour = contour.reshape(-1, 2).astype(float)
+        if contour.shape[0] < 3:
+            return None
+
+        # Close contour (ensure last point equals first) for proper arc-length
+        if not np.allclose(contour[0], contour[-1]):
+            contour = np.vstack([contour, contour[0]])
+
+        # Compute cumulative arc length
+        deltas = np.diff(contour, axis=0)
+        seg_lens = np.hypot(deltas[:, 0], deltas[:, 1])
+        cumlen = np.concatenate([[0.0], np.cumsum(seg_lens)])
+        total_len = cumlen[-1]
+        if total_len <= 0:
+            return contour[:-1]
+
+        # Determine target number of points (at least original, up to max_pts)
+        orig_n = contour.shape[0] - 1
+        target_n = min(max_pts, max(orig_n, 200))
+
+        # Sample distances uniformly along the contour
+        sample_d = np.linspace(0.0, total_len, target_n, endpoint=False)
+
+        # Interpolate x and y along arc-length
+        xs = contour[:, 0]
+        ys = contour[:, 1]
+        xs_interp = np.interp(sample_d, cumlen, xs)
+        ys_interp = np.interp(sample_d, cumlen, ys)
+        pts = np.stack([xs_interp, ys_interp], axis=1)
+
+        # Smooth via moving average kernel to remove jagged vertices
+        if pts.shape[0] >= 5:
+            win = min(21, pts.shape[0] // 2 * 2 + 1)  # odd window <=21
+            kernel = np.ones(win) / win
+            pad = win // 2
+            # pad by reflecting to avoid edge shrink
+            xs_pad = np.pad(pts[:, 0], pad, mode='reflect')
+            ys_pad = np.pad(pts[:, 1], pad, mode='reflect')
+            xs_s = np.convolve(xs_pad, kernel, mode='valid')
+            ys_s = np.convolve(ys_pad, kernel, mode='valid')
+            pts = np.stack([xs_s, ys_s], axis=1)
+
+        return pts.astype(float)
+
+    def _polygon_to_mask(self, polygon: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+        """Rasterize a polygon (Nx2 float xy) to a binary mask of given (H, W) shape."""
+        mask = np.zeros(shape, dtype=np.uint8)
+        cv2.fillPoly(mask, [polygon.astype(np.int32)], 1)
         return mask
-    
-    
-    def segment_image(self, input_path: str, output_path: str, threshold: float = 0.5, 
-                     refine: bool = True, kernel_size: int = 5, return_mask: bool = False):
+
+    def _edit_polygon(self, pil_img: Image.Image, mask: np.ndarray) -> np.ndarray:
+        """Show the SAM2 mask as a draggable polygon overlay.
+
+        Drag any vertex to refine the mask boundary.
+        Close the window to confirm and continue.
+        Returns the edited binary mask.
         """
-        Segment a single image and save with transparent background.
-        
-        Args:
-            input_path: Path to input image
-            output_path: Path to save output PNG
-            threshold: Segmentation threshold (default: 0.5)
-            refine: Apply morphological refinement (default: True)
-            kernel_size: Size of morphological kernel for refinement (default: 5)
-            return_mask: If True, also return the mask
-            
-        Returns:
-            mask (optional): Binary segmentation mask if return_mask=True
-        """
-        # Load image
-        image = Image.open(input_path).convert('RGB')
-        
-        # Predict mask using contour approach
-        mask = self.predict_mask(image, threshold, use_contours=True)
-        
-        # Refine mask if requested
-        if refine:
-            mask = self.refine_mask(mask, kernel_size)
-        
-        # Create transparent-background composite image (RGBA)
-        transparent_img = self.create_transparent_image(image, mask)
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        transparent_img.save(output_path, 'PNG')
-        if return_mask:
+        points = self._mask_to_polygon(mask)
+        if points is None or len(points) < 3:
+            print("  No editable contour — keeping original mask.")
             return mask
-    
-    def segment_directory(self, input_dir: str, output_dir: str, threshold: float = 0.5, 
-                         refine: bool = True, kernel_size: int = 5, verbose: bool = True):
-        """
-        Segment all images in a directory.
-        
-        Args:
-            input_dir: Directory containing input images
-            output_dir: Directory to save output PNGs
-            threshold: Segmentation threshold (default: 0.5)
-            refine: Apply morphological refinement (default: True)
-            kernel_size: Size of morphological kernel for refinement (default: 5)
-            verbose: Print progress
-        """
-        input_dir = Path(input_dir)
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Get all image files
-        image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
-        image_files = [f for f in input_dir.iterdir() 
-                      if f.suffix.lower() in image_extensions]
-        
-        if verbose:
-            print(f"Processing {len(image_files)} images with contour-based segmentation...")
-        
-        # Process each image
-        for i, img_file in enumerate(image_files):
-            output_path = output_dir / f"{img_file.stem}.png"
-            
-            try:
-                self.segment_image(str(img_file), str(output_path), threshold, refine, kernel_size)
-                
-                if verbose and (i + 1) % 10 == 0:
-                    print(f"  Processed {i + 1}/{len(image_files)} images")
-            
-            except Exception as e:
-                print(f"✗ Error processing {img_file.name}: {e}")
-                continue
-        
-        if verbose:
-            print(f"✓ Completed segmentation of {len(image_files)} images")
-            print(f"  Output directory: {output_dir}")
-    
-    def refine_mask(self, mask: np.ndarray, kernel_size: int = 5) -> np.ndarray:
-        """
-        Refine mask using morphological operations.
-        
-        Args:
-            mask: Binary mask
-            kernel_size: Size of morphological kernel
-            
-        Returns:
-            Refined mask
-        """
-        import cv2
-        
-        kernel = np.ones((kernel_size, kernel_size), np.uint8)
-        
-        # Remove noise
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        
-        # Fill holes
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        
-        return mask
-    
-    def segment_with_refinement(self, input_path: str, output_path: str, 
-                               threshold: float = 0.5, refine: bool = True, kernel_size: int = 5):
-        """
-        Segment image with optional mask refinement.
-        
-        Args:
-            input_path: Path to input image
-            output_path: Path to save output PNG
-            threshold: Segmentation threshold (default: 0.5)
-            refine: Apply morphological refinement (default: True)
-            kernel_size: Size of refinement kernel (default: 5)
-        """
-        # Load and predict using contour approach
-        image = Image.open(input_path).convert('RGB')
-        mask = self.predict_mask(image, threshold, use_contours=True)
-        
-        # Refine mask if requested
-        if refine:
-            mask = self.refine_mask(mask, kernel_size)
 
-        # Create transparent-background image
-        transparent_img = self.create_transparent_image(image, mask)
-        # Save
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        transparent_img.save(output_path, 'PNG')
+        h, w = np.array(pil_img).shape[:2]
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.imshow(pil_img)
+        ax.set_title(
+            "Drag vertices to refine the mask boundary. Close window to confirm.",
+            fontsize=10,
+        )
+        ax.axis('off')
+
+        # Live mask overlay
+        ov = np.zeros((h, w, 4), dtype=np.uint8)
+        ov[..., 0] = 255
+        ov[..., 3] = (mask * 80).astype(np.uint8)
+        overlay_img = ax.imshow(ov)
+
+        # Closed polygon line + vertex scatter
+        closed = np.vstack([points, points[0]])
+        (line,) = ax.plot(closed[:, 0], closed[:, 1], 'g-', linewidth=1.5, zorder=4)
+        scat = ax.scatter(
+            points[:, 0], points[:, 1],
+            c='lime', s=40, zorder=5, edgecolors='white', linewidths=0.5,
+        )
+
+        drag_idx: list = [None]
+
+        def on_press(event):
+            if event.inaxes is not ax or event.button != 1:
+                return
+            if event.xdata is None or event.ydata is None:
+                return
+            dists = np.hypot(points[:, 0] - event.xdata, points[:, 1] - event.ydata)
+            idx = int(np.argmin(dists))
+            if dists[idx] < 15:
+                drag_idx[0] = idx
+
+        def on_motion(event):
+            if drag_idx[0] is None or event.inaxes is not ax:
+                return
+            if event.xdata is None or event.ydata is None:
+                return
+            points[drag_idx[0]] = [
+                float(np.clip(event.xdata, 0, w - 1)),
+                float(np.clip(event.ydata, 0, h - 1)),
+            ]
+            cl = np.vstack([points, points[0]])
+            line.set_xdata(cl[:, 0])
+            line.set_ydata(cl[:, 1])
+            scat.set_offsets(points)
+            new_mask = self._polygon_to_mask(points, (h, w))
+            new_ov = np.zeros((h, w, 4), dtype=np.uint8)
+            new_ov[..., 0] = 255
+            new_ov[..., 3] = (new_mask * 80).astype(np.uint8)
+            overlay_img.set_data(new_ov)
+            fig.canvas.draw_idle()
+
+        def on_release(event):
+            drag_idx[0] = None
+
+        fig.canvas.mpl_connect('button_press_event', on_press)
+        fig.canvas.mpl_connect('motion_notify_event', on_motion)
+        fig.canvas.mpl_connect('button_release_event', on_release)
+
+        plt.show()
+        return self._polygon_to_mask(points, (h, w))
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def process_folder(self,
+                       input_dir: str,
+                       output_dir: str,
+                       sam_checkpoint: str,
+                       sam_config: Optional[str] = None,
+                       initial_mask_threshold: float = 0.0,
+                       initial_iou_threshold: float = 0.3,
+                       refine: bool = True,
+                       kernel_size: int = 5):
+        """Segment images one by one with resume support.
+
+        Per image: draw box → SAM2 mask → polygon editor → preview → save/redo/quit.
+        Images that already have a corresponding PNG in output_dir are skipped.
+        """
+        input_p = Path(input_dir)
+        output_p = Path(output_dir)
+        output_p.mkdir(parents=True, exist_ok=True)
+
+        exts = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
+        all_files = sorted([f for f in input_p.iterdir() if f.suffix.lower() in exts])
+        if not all_files:
+            print("No images found in folder.")
+            return
+
+        pending = [f for f in all_files if not (output_p / f"{f.stem}.png").exists()]
+        done_count = len(all_files) - len(pending)
+        if done_count:
+            print(f"Resuming: {done_count}/{len(all_files)} already processed, "
+                  f"{len(pending)} remaining.")
+        if not pending:
+            print("All images already processed.")
+            return
+
+        predictor = self._load_sam(sam_checkpoint, sam_config=sam_config)
+        mask_threshold = float(initial_mask_threshold)
+        iou_threshold = float(initial_iou_threshold)
+
+        for img_idx, f in enumerate(pending):
+            print(f"\n[{img_idx + 1}/{len(pending)}] {f.name}  "
+                  f"(mask_th={mask_threshold}, iou_th={iou_threshold})")
+            pil = Image.open(f).convert('RGB')
+            img_np = np.array(pil)
+            self._set_image(predictor, img_np)
+
+            while True:
+                # Step 1: bounding box
+                print("  Draw a bounding box around the object.")
+                box = self._get_box_from_user(pil)
+
+                # Step 2: SAM2 prediction
+                mask = self._predict_sam_mask(predictor, box,
+                                              mask_threshold=mask_threshold,
+                                              iou_threshold=iou_threshold)
+                if refine:
+                    mask = self._refine_mask(mask, kernel_size)
+
+                # Step 3: polygon editing
+                print("  Edit polygon vertices if needed, then close the window.")
+                mask = self._edit_polygon(pil, mask)
+
+                # Step 4: side-by-side preview
+                result = self._apply_mask_white_bg(pil, mask)
+                fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+                axes[0].imshow(pil)
+                axes[0].set_title("Original")
+                axes[0].axis('off')
+                axes[1].imshow(result)
+                axes[1].set_title("Result (transparent background)")
+                axes[1].axis('off')
+                fig.suptitle(f"{f.name} — close window, then respond in terminal", fontsize=11)
+                plt.show()
+
+                choice = input(
+                    "  [s]ave & next, [r]edo, [t]une thresholds, [q]uit: "
+                ).strip().lower()
+
+                if choice == 's':
+                    out_path = output_p / f"{f.stem}.png"
+                    result.save(out_path, 'PNG')
+                    print(f"  Saved → {out_path.name}")
+                    break
+                elif choice == 'r':
+                    print("  Redoing segmentation for this image.")
+                    continue
+                elif choice == 't':
+                    try:
+                        mt = input(f"    mask_threshold (current {mask_threshold}): ").strip()
+                        if mt:
+                            mask_threshold = float(mt)
+                        it = input(f"    iou_threshold  (current {iou_threshold}): ").strip()
+                        if it:
+                            iou_threshold = float(it)
+                    except ValueError as e:
+                        print(f"    Invalid input: {e}")
+                    continue
+                elif choice == 'q':
+                    print("  Stopped. Run again to resume from here.")
+                    return
+                else:
+                    print("  Unknown option.")
+
+        print(f"\nAll done — {len(pending)} images saved to {output_p}")
 
 
-def segment_filtered_images(filtered_images_dir: str, 
-                            model_path: str,
-                            output_dir: str,
-                            model_type: str = "U-NET",
-                            threshold: float = 0.5,
-                            refine: bool = True,
-                            kernel_size: int = 5):
-    """
-    Convenience function to segment all filtered images.
-    
-    Args:
-        filtered_images_dir: Directory with filtered images from preprocessing
-        model_path: Path to trained segmentation model
-        output_dir: Output directory for segmented images with transparency
-        model_type: Type of segmentation model (default: U-NET)
-        threshold: Segmentation threshold (default: 0.5)
-        refine: Apply morphological refinement (default: True)
-        kernel_size: Size of morphological kernel (default: 5)
-    """
-    print("="*60)
-    print("Starting Image Segmentation with Contour-Based Approach")
-    print("="*60)
-    
-    segmenter = ImageSegmenter(model_path, model_type)
-    
-    # Process all images with contour-based segmentation
-    segmenter.segment_directory(
-        input_dir=filtered_images_dir,
-        output_dir=output_dir,
-        threshold=threshold,
-        refine=refine,
-        kernel_size=kernel_size,
-        verbose=True
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Interactive per-image SAM2 folder segmentation with resume support."
     )
-    
-    print("="*60)
-    print("✓ Segmentation completed!")
-    print("="*60)
+    p.add_argument("--input_dir", required=True, help="Folder of input images.")
+    p.add_argument("--output_dir", required=True, help="Folder to save segmented PNGs.")
+    p.add_argument("--sam_checkpoint", required=True, help="Path to SAM2 checkpoint.")
+    p.add_argument("--sam_config", default=None,
+                   help="SAM2 config (auto-detected from checkpoint name if omitted).")
+    p.add_argument("--mask_threshold", type=float, default=0.0,
+                   help="Logit threshold (default 0.0 = 50%% prob). Lower = larger mask.")
+    p.add_argument("--iou_threshold", type=float, default=0.3,
+                   help="Min predicted IoU to accept a mask candidate (default 0.3).")
+    p.add_argument("--no_refine", action="store_true",
+                   help="Disable morphological mask refinement.")
+    p.add_argument("--kernel_size", type=int, default=5,
+                   help="Morphological kernel size (default 5).")
+    return p.parse_args()
 
 
-if __name__ == "__main__":
-    # Example usage
-    segment_filtered_images(
-        filtered_images_dir="../reconstructions/InstantNGP_preprocessed/filtered_images",
-        model_path="../models/U-NET_seg.pt",
-        output_dir="../reconstructions/InstantNGP_preprocessed/segmented_images",
-        model_type="U-NET"
+def main():
+    args = parse_args()
+    seg = SamFolderSegmenter()
+    seg.process_folder(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        sam_checkpoint=args.sam_checkpoint,
+        sam_config=args.sam_config,
+        initial_mask_threshold=args.mask_threshold,
+        initial_iou_threshold=args.iou_threshold,
+        refine=not args.no_refine,
+        kernel_size=args.kernel_size,
     )
+
+
+if __name__ == '__main__':
+    main()
+
+__all__ = ["SamFolderSegmenter"]

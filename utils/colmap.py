@@ -345,3 +345,120 @@ def save_colmap_geometries_ply(geometries: List[o3d.geometry.Geometry], out_path
     out_p.parent.mkdir(parents=True, exist_ok=True)
     o3d.io.write_point_cloud(str(out_p), pcd)
     return str(out_p)
+
+
+# ---------------------------------------------------------------------------
+# NeRF-compatible data loading from a COLMAP reconstruction
+# ---------------------------------------------------------------------------
+
+def colmap_qvec_tvec_to_c2w(qvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
+    """Convert a COLMAP world-to-camera pose (quaternion + translation) to a
+    camera-to-world 4×4 matrix in the same convention used by tiny_nerf.
+
+    Args:
+        qvec: quaternion [qw, qx, qy, qz] (world-to-camera rotation).
+        tvec: translation [tx, ty, tz] (world-to-camera).
+
+    Returns:
+        c2w: (4, 4) float64 camera-to-world matrix.
+    """
+    qw, qx, qy, qz = float(qvec[0]), float(qvec[1]), float(qvec[2]), float(qvec[3])
+    R = np.array([
+        [1 - 2 * (qy * qy + qz * qz),     2 * (qx * qy - qz * qw),     2 * (qx * qz + qy * qw)],
+        [    2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz),     2 * (qy * qz - qx * qw)],
+        [    2 * (qx * qz - qy * qw),     2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+    ], dtype=np.float64)
+    c2w = np.eye(4, dtype=np.float64)
+    c2w[:3, :3] = R.T
+    c2w[:3, 3] = -R.T @ np.asarray(tvec, dtype=np.float64)
+    return c2w
+
+
+def load_nerf_data_from_colmap(
+    model_dir: str,
+    images_dir: str,
+    train_test_ratio: int = 100,
+    image_size: Optional[Tuple[int, int]] = None,
+) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
+    """Load a COLMAP reconstruction into NeRF-compatible numpy arrays.
+
+    Mirrors the format of ``tiny_nerf_data.npz`` so the arrays can be dropped
+    directly into a training loop::
+
+        train_images, train_poses, focal, test_images, test_poses = \\
+            load_nerf_data_from_colmap(model_dir, images_dir)
+
+        # equivalent to the tiny_nerf cell:
+        #   images = data['images'][:100, ..., :3]
+        #   poses  = data['poses'][:100]
+        #   focal  = data['focal']
+
+    The dataset is split so that one in every ``(train_test_ratio + 1)`` frames
+    becomes a test frame, matching the ~100:1 ratio of the tiny NeRF dataset.
+
+    Args:
+        model_dir:        Path to the folder with COLMAP binary/text model files.
+        images_dir:       Path to the folder containing the source images.
+        train_test_ratio: Training images per test image (default 100, same as
+                          the tiny NeRF dataset's 100:1 split).
+        image_size:       Optional ``(H, W)`` to resize every image; if ``None``
+                          the original resolution is kept.
+
+    Returns:
+        train_images : float32 array (N_train, H, W, 3), values in [0, 1].
+        train_poses  : float32 array (N_train, 4, 4), camera-to-world matrices.
+        focal        : float, focal length in pixels (taken from camera 0).
+        test_images  : float32 array (N_test, H, W, 3).
+        test_poses   : float32 array (N_test, 4, 4).
+    """
+    from PIL import Image as _PILImage  # soft dependency – only needed here
+
+    cams, images_meta, _ = load_colmap_model(model_dir)
+
+    # Sort by filename for a deterministic, reproducible ordering
+    sorted_ids = sorted(images_meta.keys(), key=lambda k: images_meta[k]["name"])
+    n_total = len(sorted_ids)
+
+    # Every (train_test_ratio + 1)-th frame is held out as test,
+    # matching the ~100:1 proportion of the tiny NeRF dataset.
+    test_step = train_test_ratio + 1
+    test_set = set(range(test_step, n_total, test_step))
+    if not test_set:
+        test_set = {n_total - 1}  # always keep at least one test image
+
+    all_images: List[np.ndarray] = []
+    all_poses: List[np.ndarray] = []
+    is_train: List[bool] = []
+
+    for position, img_id in enumerate(sorted_ids):
+        meta = images_meta[img_id]
+        img_path = Path(images_dir) / meta["name"]
+        if not img_path.exists():
+            continue
+
+        pil_img = _PILImage.open(str(img_path)).convert("RGB")
+        if image_size is not None:
+            pil_img = pil_img.resize((image_size[1], image_size[0]), _PILImage.LANCZOS)
+        all_images.append(np.array(pil_img, dtype=np.float32) / 255.0)
+        all_poses.append(colmap_qvec_tvec_to_c2w(meta["qvec"], meta["tvec"]))
+        is_train.append(position not in test_set)
+
+    if not all_images:
+        raise RuntimeError("No images could be loaded from " + str(images_dir))
+
+    imgs_arr = np.stack(all_images, axis=0).astype(np.float32)   # (N, H, W, 3)
+    poses_arr = np.stack(all_poses, axis=0).astype(np.float32)   # (N, 4, 4)
+    mask = np.array(is_train, dtype=bool)
+
+    # Focal length: prefer fx from the first registered camera
+    focal: float = 1.0
+    if cams:
+        cam = next(iter(cams.values()))
+        params = cam.get("params", [])
+        model_name = cam.get("model", "").upper()
+        if model_name == "SIMPLE_PINHOLE" and params:
+            focal = float(params[0])           # f
+        elif params:
+            focal = float(params[0])           # fx for PINHOLE / RADIAL / OPENCV …
+
+    return imgs_arr[mask], poses_arr[mask], focal, imgs_arr[~mask], poses_arr[~mask]

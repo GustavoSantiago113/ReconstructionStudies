@@ -1,7 +1,16 @@
-## Contributing
+<center>
 
-Contributions are welcome! Feel free to open issues or submit pull requests to improve the repository.
+# Reconstruction Studies
 
-## License
+</center>
 
-This repository includes submodules and dependencies with their own licenses. Please refer to the respective `LICENSE` files for details.
+---
+
+## Data Retrieve
+
+Download the data to be used in this study by:
+
+```bash
+cd data
+python -m wget http://cseweb.ucsd.edu/~viscomp/projects/LF/papers/ECCV20/nerf/tiny_nerf_data.npz
+```

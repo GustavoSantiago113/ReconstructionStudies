@@ -1,61 +1,101 @@
 # A Description of each of the Reconstruction Methods
 
-## COLMAP
+## COLMAP - Structure-from-Motion Revisited
 
-**Structure-from-Motion Revisited** is a 2016 CVPR paper by Johannes L. Schönberger and Jan-Michael Frahm that redesigns incremental SfM to be more robust, accurate, complete, and scalable, and it became the basis for COLMAP’s open-source reconstruction pipeline.
+**Structure-from-Motion Revisited** is a 2016 CVPR paper by Johannes L. Schönberger and Jan-Michael Frahm that redesigns incremental SfM (Structure-from-Motion) to be more robust, accurate, complete, and scalable, and it became the basis for COLMAP’s open-source reconstruction pipeline.
 
-## Core problem
+### COLMAP Pipeline Workflow
 
-The paper starts from a simple observation: incremental SfM was already the dominant approach for unordered photo collections, but existing systems still struggled to be truly general-purpose because they often failed on completeness, robustness, or speed. The authors frame SfM as a pipeline of correspondence search, geometric verification, incremental reconstruction, triangulation, and bundle adjustment, and argue that weaknesses in any one of these stages can cascade into failure. Their goal is not a new theory of SfM, but a practical system that fixes the most damaging failure modes of real-world reconstruction.
+### 1. Input images
+- Collect an unordered or ordered set of images of the scene.  
+- COLMAP supports reconstruction of both sparse and dense geometry from these images.
 
-## Pipeline overview
+### 2. Feature extraction
+- Detect keypoints and compute local descriptors for every image.  
+- This creates the feature database used by later matching and reconstruction stages.
 
-The paper’s system keeps the standard incremental SfM structure, but improves each stage with targeted heuristics and robust estimation. It begins by extracting local features, matching candidate image pairs, and verifying geometry to create a scene graph, then seeds reconstruction from a carefully chosen two-view pair, adds images one by one, triangulates new points, and repeatedly runs bundle adjustment. A key theme is that image registration and triangulation depend on each other, so the system repeatedly alternates between them rather than treating reconstruction as a one-shot process.
+### 3. Feature matching
+- Match features across image pairs using a matcher such as:
+  - `exhaustive_matcher`
+  - `sequential_matcher`
+  - `vocab_tree_matcher`  
+- Geometric verification removes bad correspondences and builds the scene graph for SfM.
 
-## Main contributions
+### 4. Sparse reconstruction
+- Start incremental SfM with `mapper`.  
+- COLMAP seeds reconstruction from a strong initial image pair, then repeatedly:
+  - registers a new image,
+  - triangulates new points,
+  - runs bundle adjustment,
+  - filters outliers,
+  - continues growing the model.
 
-The first major contribution is **scene graph augmentation**: instead of keeping only a binary “matched or not” graph, the system classifies image pairs by geometric relation, such as general motion, planar scenes, panoramas, or problematic watermark/timestamp/frame pairs, which helps avoid bad seeds and bad triangulation. The second contribution is a **next-best-view selection** strategy that scores candidate images not just by how many points they see, but also by how well those points are distributed in the image, which improves pose estimation quality.
+### 5. Sparse model output
+- The result is a sparse 3D point cloud plus estimated camera poses.  
+- Multiple disconnected sparse models may be produced if the image collection breaks into separate components.
 
-The third contribution is **robust triangulation** using RANSAC over feature tracks, which allows the method to recover from contaminated tracks and even separate multiple points that were incorrectly merged into one track. The fourth contribution is an **iterative refine-and-retriangulate loop**: after bundle adjustment, the system filters outliers, triangulates again, and repeats until improvements saturate, which reduces drift and increases completeness. The fifth contribution is **redundant view mining**, a way to group highly overlapping cameras so bundle adjustment becomes cheaper on dense Internet photo collections.
+### 6. Image undistortion
+- Use the sparse model to undistort images before dense reconstruction.  
+- This prepares consistent camera geometry for Multi-View Stereo.
 
-## Why the changes matter
+### 7. Dense reconstruction
+- Run PatchMatch stereo to estimate depth maps.  
+- Then fuse the depth maps into a denser 3D representation.
 
-The paper’s central insight is that SfM failures often come from weak data flow between stages rather than from a single bad optimizer. For example, if the scene graph is incomplete, the model may never gain enough connectivity; if triangulation is too brittle, later image registration becomes impossible; and if bundle adjustment is too expensive, the system cannot refine often enough to stay stable. The paper therefore treats incremental SfM as a coupled control problem: choose good images, keep the graph clean, triangulate aggressively but robustly, and refine repeatedly.
+### 8. Mesh generation
+- Optionally convert the dense point cloud into a mesh using Poisson or Delaunay meshing.  
+- This produces a surface model suitable for visualization or downstream use.
 
-## Next-best-view idea
+### Simple command flow
 
-Their next-best-view method is especially interesting because it formalizes a common heuristic. Rather than selecting the image with the most visible triangulated points, the algorithm prefers views whose visible points are both numerous and spatially well spread across the image, using a multi-resolution grid score. This helps avoid poorly conditioned PnP problems and leads to better registration order, which in turn improves final accuracy and robustness. In practice, the paper shows that different selection rules may converge to the same set of registered images, but not to the same reconstruction quality.
-
-## Robust triangulation and refinement
-
-The triangulation section is one of the paper’s most practically important parts. Instead of assuming that a feature track is clean, the authors explicitly model the possibility that a track contains outliers or even multiple merged 3D points, and they use RANSAC to find a valid consensus pair before recursively splitting the track if needed. This is more robust than exhaustive pairwise triangulation, and the experiments show it can increase completeness while reducing compute.
-
-Bundle adjustment is also handled with a very pragmatic mindset. The system performs local BA after each registration, global BA periodically, and then filtering and retriangulation, because doing a single optimization pass is not enough to eliminate drift in large reconstruction problems. The redundant-view grouping further reduces cost by collapsing highly overlapping images into shared parameter blocks, which matters especially for dense photo collections where many images observe almost the same structure.
-
-## Experimental findings
-
-The authors evaluate on 17 datasets totaling 144,953 unordered Internet photos, comparing against Bundler, VisualSFM, DISCO, and Theia. Their results show substantial gains in the number of registered images, number of reconstructed points, and reconstruction quality, while keeping runtime competitive or better in the parts of the pipeline that dominate overall cost. The paper also reports that the next-best-view strategy improves pose quality, the RANSAC-based triangulation handles heavy outlier contamination well, and the iterative BA/retriangulation loop significantly increases completeness.
-
-## Overall takeaway
-
-The main message of the paper is that incremental SfM becomes much stronger when every stage is made robust to the real messiness of Internet photo collections. Rather than relying on a single clever solver, the paper combines geometry-aware matching, better initialization, smarter view ordering, outlier-resistant triangulation, repeated refinement, and efficiency tricks for BA into a unified system. That practical systems viewpoint is why the paper remains influential: it helped turn COLMAP into one of the standard SfM pipelines in research and practice.
-
+```text
+feature_extractor -> matcher -> mapper -> image_undistorter -> patch_match_stereo -> stereo_fusion -> meshing
+```
 ---
 
-COLMAP implements the paper’s SfM ideas as an incremental reconstruction pipeline: extract features, match them, verify geometry, seed from a good initial pair, then repeatedly register new images, triangulate new points, and run bundle adjustment. The paper itself was contributed as the open-source implementation that became COLMAP, so the software is effectively the practical realization of that design.
+## NeRF - NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis
 
-## Pipeline stages
-COLMAP separates SfM into the same three high-level stages described in the paper: feature detection/extraction, feature matching + geometric verification, and structure/motion reconstruction. In the usual workflow, feature_extractor builds the database, a matcher such as exhaustive_matcher, sequential_matcher, or vocab_tree_matcher creates candidate pairs, and geometric verification estimates pairwise epipolar geometry before reconstruction starts. The sparse reconstruction itself is handled by mapper, which is the incremental SfM engine.
+NeRF is a method for turning a set of photos of a scene into a continuous 3D representation that can render new viewpoints with very realistic lighting and detail. In plain English, it teaches a neural network to answer: “If I stand at this 3D point and look in this direction, what color and how much stuff is there?”.
 
-## How it matches the paper
-The paper’s incremental SfM design is reflected almost directly in COLMAP’s mapper behavior. COLMAP loads the verified matches, seeds the reconstruction from an initial image pair, and then grows the model by registering new images and triangulating new points, exactly as described in the tutorial and CLI docs. It also supports multiple disconnected models if the image set cannot all be merged into one reconstruction, which mirrors the paper’s emphasis on robustness to incomplete or fragmented scene graphs.
+### What the paper solves
 
-## Paper ideas in COLMAP
-Several ideas from the paper are exposed as explicit COLMAP behaviors rather than hidden theory. The paper’s focus on better matching and view selection is reflected in the different matchers COLMAP provides, especially vocabulary-tree and sequential matching for large or video-like datasets. The paper’s iterative refine/retriangulate philosophy shows up in COLMAP’s repeated local/global bundle adjustment and its ability to triangulate or filter points after new registrations.
+The paper tackles **view synthesis**: given images from some camera positions, generate what the scene would look like from a new camera position. Traditional methods often relied on explicit surfaces or voxels, which can struggle with fine details, transparency, and view-dependent effects like reflections. NeRF instead represents the scene as a continuous function, so it is not limited by a fixed 3D grid.
 
-## Practical command flow
-A standard COLMAP SfM run looks like this: feature_extractor, exhaustive_matcher or another matcher, then mapper for sparse reconstruction. For example, the CLI docs show the exact sequence feature_extractor -> exhaustive_matcher -> mapper, with optional image_undistorter, patch_match_stereo, and meshing afterward for dense reconstruction. So COLMAP is not just “based on” the paper; it operationalizes the paper as a modular set of commands you can mix and tune.
+### How the model works
+
+NeRF uses a fully connected neural network that takes two things as input: a 3D location (x,y,z) and a viewing direction. For that location and direction, the network predicts two outputs: the **density** of matter at that point and the **emitted color** seen from that direction. Density tells the renderer how likely light is to be blocked or absorbed there, while color tells it what light leaves that point toward the camera.
+
+![nerf_network](images/nerf_neural_network.png)
+
+To render an image, NeRF traces a ray through every pixel of the virtual camera into the 3D scene and samples many points along that ray. At each sampled point, it asks the network for color and density, then combines all those samples using volume rendering to compute the final pixel color. That is the key trick: the scene is never stored as a mesh or point cloud; it is stored implicitly in the network’s weights.
+
+![nerf_example](images/nerf_example.png)
+
+### Why it can render new views
+
+The network is trained so that, when the rendered image from a known camera pose is compared to the real photo, the difference is small. Because the training uses many posed images of the same scene, the model learns a consistent 3D explanation that works from all viewpoints. Once trained, you can move the virtual camera anywhere and render a new view by repeating the same ray-sampling process.
+
+### Why the result looks good
+
+A major strength of NeRF is that it models **view dependence**, meaning the same point can look different depending on angle. That matters for shiny surfaces, glass, and subtle lighting effects, where the observed color is not just a property of the object but also of the viewing direction. This is one reason NeRF often produces more realistic novel views than older methods.
+
+### Training in practice
+
+The original paper trains one network per scene, rather than a single universal model for all scenes. It also uses positional encoding to help the network represent fine spatial detail, since ordinary neural networks tend to oversmooth high-frequency patterns. In effect, the method starts with a blurry shape and gradually learns sharper geometry, textures, and lighting effects as training continues.
+
+### Intuition in one example
+
+Imagine a room photographed from many spots. NeRF learns a function that can answer: “At this exact point in space, how solid is it, and what color does it appear from this angle?”. When rendering a new photo, it sends a ray through each pixel, collects those answers along the ray, and blends them into the final image. If a chair blocks the wall, the chair’s density dominates the ray and the wall contributes less, which is how occlusion is modeled.
+
+### Main takeaway
+
+The paper’s core idea is surprisingly simple: **replace an explicit 3D model with a neural function that can be queried anywhere in space and from any direction**. That function is trained from posed images using differentiable volume rendering, and the result is a scene representation that can synthesize highly realistic new views.
+
+
+---
 
 # References
 
 Schonberger, J. L., & Frahm, J.-M. (2016). Structure-from-Motion Revisited. 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 4104–4113. https://doi.org/10.1109/CVPR.2016.445
+
+Mildenhall, B., Srinivasan, P. P., Tancik, M., Barron, J. T., Ramamoorthi, R., & Ng, R. (2020). NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis (arXiv:2003.08934). arXiv. https://doi.org/10.48550/arXiv.2003.08934

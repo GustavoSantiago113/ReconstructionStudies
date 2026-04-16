@@ -371,7 +371,21 @@ def colmap_qvec_tvec_to_c2w(qvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
     c2w = np.eye(4, dtype=np.float64)
     c2w[:3, :3] = R.T
     c2w[:3, 3] = -R.T @ np.asarray(tvec, dtype=np.float64)
+    # COLMAP camera frame: X right, Y down, Z forward.
+    # NeRF/OpenGL camera frame (expected by get_rays): X right, Y up, Z backward.
+    # Flip columns 1 and 2 of the rotation block to match conventions.
+    c2w[:3, 1:3] *= -1
     return c2w
+
+
+def set_numpy_print_scientific(precision: int = 8) -> None:
+    """Set numpy print options to scientific notation for floats.
+
+    This affects how numpy arrays (including poses) are displayed when printed.
+    Use with care because it changes global numpy settings for the process.
+    """
+    fmt = {"float_kind": lambda x: f"{x:.{precision}e}"}
+    np.set_printoptions(formatter=fmt)
 
 
 def load_nerf_data_from_colmap(
@@ -379,6 +393,8 @@ def load_nerf_data_from_colmap(
     images_dir: str,
     train_test_ratio: int = 100,
     image_size: Optional[Tuple[int, int]] = None,
+    print_scientific: bool = False,
+    normalize_poses: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
     """Load a COLMAP reconstruction into NeRF-compatible numpy arrays.
 
@@ -429,6 +445,8 @@ def load_nerf_data_from_colmap(
     all_images: List[np.ndarray] = []
     all_poses: List[np.ndarray] = []
     is_train: List[bool] = []
+    orig_w: Optional[int] = None
+    orig_h: Optional[int] = None
 
     for position, img_id in enumerate(sorted_ids):
         meta = images_meta[img_id]
@@ -437,6 +455,9 @@ def load_nerf_data_from_colmap(
             continue
 
         pil_img = _PILImage.open(str(img_path)).convert("RGB")
+        # record the original image size (before any optional resizing)
+        if orig_w is None:
+            orig_w, orig_h = pil_img.width, pil_img.height
         if image_size is not None:
             pil_img = pil_img.resize((image_size[1], image_size[0]), _PILImage.LANCZOS)
         all_images.append(np.array(pil_img, dtype=np.float32) / 255.0)
@@ -450,6 +471,25 @@ def load_nerf_data_from_colmap(
     poses_arr = np.stack(all_poses, axis=0).astype(np.float32)   # (N, 4, 4)
     mask = np.array(is_train, dtype=bool)
 
+    if normalize_poses:
+        # 1. Centre: shift every camera position by the mean camera position so
+        #    the scene is roughly centred at the world origin.
+        cam_centers = poses_arr[:, :3, 3]
+        scene_center = cam_centers.mean(axis=0)
+        poses_arr[:, :3, 3] -= scene_center
+        # 2. Scale: bring the median camera distance to target_radius (4.0)
+        #    so that near=2 / far=6 brackets the scene, matching tiny_nerf.
+        target_radius = 4.0
+        dists = np.linalg.norm(poses_arr[:, :3, 3], axis=1)
+        pose_scale = float(target_radius / (np.median(dists) + 1e-8))
+        poses_arr[:, :3, 3] *= pose_scale
+        dists_scaled = dists * pose_scale
+        print(f"Pose normalisation: scene_center={scene_center}, scale={pose_scale:.4f}")
+        print(f"  Camera distance range after scaling: "
+              f"{dists_scaled.min():.3f} – {dists_scaled.max():.3f}")
+        print(f"  Suggested near={dists_scaled.min() * 0.5:.2f}, "
+              f"far={dists_scaled.max() * 1.5:.2f}")
+
     # Focal length: prefer fx from the first registered camera
     focal: float = 1.0
     if cams:
@@ -460,5 +500,22 @@ def load_nerf_data_from_colmap(
             focal = float(params[0])           # f
         elif params:
             focal = float(params[0])           # fx for PINHOLE / RADIAL / OPENCV …
+
+    # If images were resized, scale the focal length (in pixels) accordingly.
+    # We scale by the width ratio (new_width / original_width) to keep focal
+    # consistent with how image widths are being resized above.
+    if image_size is not None and orig_w is not None:
+        try:
+            scale = float(image_size[1]) / float(orig_w)
+            focal = float(focal) * scale
+        except Exception:
+            pass
+
+    # Optionally set numpy's float printing to scientific notation so that
+    # printed poses look like e.g. -9.9990219e-01 consistently.
+    if print_scientific:
+        def _fmt(x):
+            return f"{x:.8e}"
+        np.set_printoptions(formatter={"float_kind": lambda x: _fmt(x)})
 
     return imgs_arr[mask], poses_arr[mask], focal, imgs_arr[~mask], poses_arr[~mask]

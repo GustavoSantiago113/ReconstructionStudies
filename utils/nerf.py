@@ -7,6 +7,7 @@ import numpy as np
 import os
 from tqdm import tqdm
 import torch.nn.functional as F
+import math
 
 def encoding(x, L=10):
   res = [x]
@@ -39,6 +40,19 @@ class NeRF(nn.Module):
 
      self.color_linear1 = nn.Sequential(nn.Linear(hidden+view_enc_dim,hidden//2),nn.ReLU())
      self.color_linear2 = nn.Sequential(nn.Linear(hidden//2,3),nn.Sigmoid())
+
+     self._init_weights()
+
+  def _init_weights(self):
+    for m in self.modules():
+        if isinstance(m, nn.Linear):
+            init.kaiming_normal_(m.weight, nonlinearity='relu')
+            if m.bias is not None:
+                init.zeros_(m.bias)
+    # Use xavier for the sigmoid output layer
+    for m in self.color_linear2.modules():
+        if isinstance(m, nn.Linear):
+            init.xavier_uniform_(m.weight)
 
   def forward(self, input):
 
@@ -156,14 +170,20 @@ def render_rays(network_fn, rays_o, rays_d, near, far, N_samples, device, rand=F
 
     return rgb_map, depth_map, acc_map
 
-def train(images, poses, H, W, focal, testpose, testimg, n_iter, n_samples, i_plot, i_val, device):
+def train(images, poses, H, W, focal, testpose, testimg, n_iter, n_samples, i_plot, i_val, device, batch_size=4096):
     use_amp = (device == "cuda")
     print(f"Using device: {device}")
     model = NeRF().to(device)
 
     criterion = nn.MSELoss(reduction='mean')
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iter, eta_min=1e-5)
+    warmup_iters = n_iter // 20
+    def lr_fn(step):
+        if step < warmup_iters:
+            return max(0.01, step / max(1, warmup_iters))
+        progress = (step - warmup_iters) / max(1, n_iter - warmup_iters)
+        return max(1e-5 / 5e-4, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
 
     amp_device = "cuda" if device == "cuda" else "cpu"
     scaler = torch.amp.GradScaler(amp_device, enabled=use_amp)
@@ -175,21 +195,35 @@ def train(images, poses, H, W, focal, testpose, testimg, n_iter, n_samples, i_pl
     images_tensor = torch.from_numpy(images).float().to(device)
     poses_tensor = torch.from_numpy(poses).float().to(device)
 
+    # Pre-compute all rays for stable random-ray sampling
+    all_rays_o = []
+    all_rays_d = []
+    all_rgbs = []
+    for idx in range(images.shape[0]):
+        pose = poses_tensor[idx]
+        rays_o, rays_d = get_rays(H, W, focal, pose)
+        all_rays_o.append(rays_o)
+        all_rays_d.append(rays_d)
+        all_rgbs.append(images_tensor[idx].reshape(-1, 3))
+    all_rays_o = torch.cat(all_rays_o, 0)
+    all_rays_d = torch.cat(all_rays_d, 0)
+    all_rgbs = torch.cat(all_rgbs, 0)
+    n_total_rays = all_rays_o.shape[0]
+
     pbar = tqdm(range(n_iter), desc="Training NeRF", unit="iter")
     for i in pbar:
-        img_i = np.random.randint(images.shape[0])
-        target = images_tensor[img_i]
-        pose = poses_tensor[img_i]
+        ray_idx = torch.randint(0, n_total_rays, (batch_size,))
+        batch_rays_o = all_rays_o[ray_idx]
+        batch_rays_d = all_rays_d[ray_idx]
+        target = all_rgbs[ray_idx]
 
-        rays_o, rays_d = get_rays(H, W, focal, pose)
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(device_type=amp_device, enabled=use_amp):
             rgb, depth, acc = render_rays(
-                model, rays_o, rays_d,
+                model, batch_rays_o, batch_rays_d,
                 near=2., far=6., N_samples=n_samples, device=device, rand=True
             )
-            rgb = rgb.reshape(H, W, 3)
             loss = criterion(rgb, target)
 
         scaler.scale(loss).backward()
@@ -201,14 +235,14 @@ def train(images, poses, H, W, focal, testpose, testimg, n_iter, n_samples, i_pl
 
         if i % i_val == 0:
             with torch.no_grad():
-                rays_o, rays_d = get_rays(H, W, focal, testpose)
+                test_rays_o, test_rays_d = get_rays(H, W, focal, testpose)
                 with torch.amp.autocast(device_type=amp_device, enabled=use_amp):
-                    rgb, depth, acc = render_rays(
-                        model, rays_o, rays_d,
+                    val_rgb, val_depth, val_acc = render_rays(
+                        model, test_rays_o, test_rays_d,
                         near=2., far=6., N_samples=n_samples, device=device
                     )
-                    rgb = rgb.reshape(H, W, 3)
-                    val_loss = criterion(rgb, testimg)
+                    val_rgb = val_rgb.reshape(H, W, 3)
+                    val_loss = criterion(val_rgb, testimg)
                     psnr = -10. * torch.log10(val_loss)
 
             psnrs.append(psnr.item())
@@ -216,6 +250,15 @@ def train(images, poses, H, W, focal, testpose, testimg, n_iter, n_samples, i_pl
             pbar.set_postfix(loss=f"{loss.item():.6f}", psnr=f"{psnr.item():.2f}")
 
         if i % i_plot == 0:
+            with torch.no_grad():
+                test_rays_o, test_rays_d = get_rays(H, W, focal, testpose)
+                with torch.amp.autocast(device_type=amp_device, enabled=use_amp):
+                    plot_rgb, plot_depth, _ = render_rays(
+                        model, test_rays_o, test_rays_d,
+                        near=2., far=6., N_samples=n_samples, device=device
+                    )
+                    plot_rgb = plot_rgb.reshape(H, W, 3)
+
             print(f'Iteration: {i}, Loss: {loss.item():.6f}, Time: {(time.time() - t) / i_plot:.2f} secs per iter')
             t = time.time()
 
@@ -224,13 +267,13 @@ def train(images, poses, H, W, focal, testpose, testimg, n_iter, n_samples, i_pl
             plt.imshow(testimg.cpu().detach())
             plt.title('Ground Truth')
             plt.subplot(142)
-            plt.imshow(rgb.cpu().detach())
+            plt.imshow(plot_rgb.cpu().detach())
             plt.title(f'Iteration: {i}')
             plt.subplot(143)
             plt.plot(iternums, psnrs)
             plt.title('PSNR')
             plt.subplot(144)
-            depth_img = depth.cpu().detach().reshape(H, W)
+            depth_img = plot_depth.cpu().detach().reshape(H, W)
             plt.imshow(depth_img, cmap='viridis')
             plt.colorbar()
             plt.title('Depth')

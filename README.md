@@ -58,6 +58,7 @@ Run the notebooks to reproduce experiments and view intermediate outputs in [res
 
 ## Demonstrations
 
+See the 360 of the output reconstructions for each method below:
 
 ## Results
 

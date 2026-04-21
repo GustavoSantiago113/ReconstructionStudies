@@ -1,4 +1,4 @@
-# A Description of each of the Reconstruction Methods
+# A Description of each of the Reconstruction Methods - From Perplexity AI
 
 ## COLMAP - Structure-from-Motion Revisited
 
@@ -91,6 +91,8 @@ Imagine a room photographed from many spots. NeRF learns a function that can ans
 
 The paper’s core idea is surprisingly simple: **replace an explicit 3D model with a neural function that can be queried anywhere in space and from any direction**. That function is trained from posed images using differentiable volume rendering, and the result is a scene representation that can synthesize highly realistic new views.
 
+---
+
 ## Dust3r
 
 DUSt3R is a **pairwise 3D reconstruction model** that skips camera calibration and pose estimation up front, and instead directly predicts dense 3D point maps from images. In plain English, it tries to answer: “For every pixel in these photos, where is that point in 3D space?”.
@@ -131,6 +133,43 @@ The paper’s big idea is to replace the classical “estimate cameras first, th
 
 ---
 
+## VGGT
+
+VGGT is a feed-forward 3D vision model that directly predicts camera parameters, depth maps, point maps, and 3D point tracks from one or many images in a single pass. In plain English, it tries to replace a chunk of the usual SfM/MVS pipeline with one transformer that “understands” scene geometry well enough to infer the important 3D pieces directly.
+
+### What problem it solves
+
+Classic 3D reconstruction pipelines usually rely on separate stages for feature matching, camera pose estimation, depth estimation, and geometric optimization. VGGT aims to unify those tasks so the model can infer all the main geometric outputs at once, without post-processing refinement. The paper emphasizes that it is both simple and fast, reconstructing scenes in under a second for many inputs.
+
+### How the model works
+
+VGGT takes a set of images and turns them into tokens, typically using a visual backbone such as DINO-style image embeddings, then adds special camera-related tokens before feeding everything into a large transformer. The transformer alternates between attention within each frame and attention across all frames, so it can understand both local image content and multi-view geometry at the same time. After that, separate heads predict camera pose, depth, point maps, and tracks.
+
+![vggt](images/vggt.png)
+
+### Why alternating attention matters
+
+The alternating-attention design is the key architectural idea. Frame-wise attention helps the model understand each image on its own, while global attention lets it compare views and reason about shared 3D structure. That balance is what makes the network good at both per-image understanding and multi-view alignment.
+
+### What each output means
+
+Camera prediction gives the model’s estimate of intrinsics and extrinsics, which tells you where each photo was taken from. Depth maps tell you how far surfaces are from each camera, while point maps directly assign 3D coordinates to pixels. Track predictions follow selected image points across views, which helps with correspondence and scene understanding.
+
+### Why it is useful
+
+VGGT is designed to be a **unified** geometry model rather than a task-specific one. That means you can use the same model for pose estimation, dense reconstruction, depth prediction, and tracking instead of chaining together several separate systems. The paper reports state-of-the-art results on multiple 3D tasks and says the model generalizes well to unseen datasets.
+
+### Intuition in plain English
+
+Think of VGGT as a very strong visual guesser: it looks at all the photos together and says, “Here is where the cameras are, here is the 3D shape, here is the depth, and here are the corresponding points across images”. Instead of first finding matches and then solving geometry explicitly, it learns geometry-aware representations end to end. That is why the paper describes it as a feed-forward, geometry-grounded transformer.
+
+### Main takeaway
+
+The main contribution of VGGT is not a new classical geometry algorithm, but a transformer that learns to output the geometric quantities that traditional pipelines labor to recover step by step. In practice, that makes 3D reconstruction simpler, faster, and more unified, while still producing useful camera and scene structure.
+
+
+---
+
 # References
 
 Schonberger, J. L., & Frahm, J.-M. (2016). Structure-from-Motion Revisited. 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 4104–4113. https://doi.org/10.1109/CVPR.2016.445
@@ -138,3 +177,5 @@ Schonberger, J. L., & Frahm, J.-M. (2016). Structure-from-Motion Revisited. 2016
 Mildenhall, B., Srinivasan, P. P., Tancik, M., Barron, J. T., Ramamoorthi, R., & Ng, R. (2020). NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis (arXiv:2003.08934). arXiv. https://doi.org/10.48550/arXiv.2003.08934
 
 Wang, S., Leroy, V., Cabon, Y., Chidlovskii, B., & Revaud, J. (2024). Dust3r: Geometric 3d vision made easy. In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition (pp. 20697-20709). https://doi.org/10.48550/arXiv.2312.14132
+
+Wang, J., Chen, M., Karaev, N., Vedaldi, A., Rupprecht, C., & Novotny, D. (2025). Vggt: Visual geometry grounded transformer. In Proceedings of the Computer Vision and Pattern Recognition Conference (pp. 5294-5306). https://doi.org/10.48550/arXiv.2503.11651

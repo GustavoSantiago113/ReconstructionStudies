@@ -91,6 +91,43 @@ Imagine a room photographed from many spots. NeRF learns a function that can ans
 
 The paper’s core idea is surprisingly simple: **replace an explicit 3D model with a neural function that can be queried anywhere in space and from any direction**. That function is trained from posed images using differentiable volume rendering, and the result is a scene representation that can synthesize highly realistic new views.
 
+## Dust3r
+
+DUSt3R is a **pairwise 3D reconstruction model** that skips camera calibration and pose estimation up front, and instead directly predicts dense 3D point maps from images. In plain English, it tries to answer: “For every pixel in these photos, where is that point in 3D space?”.
+
+### What the paper solves
+
+Traditional SfM and MVS pipelines usually depend on calibrated cameras, feature matching, triangulation, and separate pose estimation steps. DUSt3R removes that dependency by learning to reconstruct geometry directly from image pairs, even when the camera intrinsics and viewpoints are unknown. The result is a more unified system for depth, pose, and reconstruction tasks.
+
+### Core idea
+
+The model predicts a **point map** for each image, meaning every pixel is assigned a 3D coordinate instead of just a depth value. Those point maps encode both scene geometry and correspondence information, so matching pixels across views and inferring camera motion become downstream steps rather than separate hand-designed modules. This is the central design choice that makes DUSt3R feel different from classic geometry pipelines.
+
+![dust3r](images/dust3r.png)
+
+### How it works
+
+DUSt3R takes a pair of images and processes them with a Transformer-based encoder-decoder architecture. The network jointly sees both images and regresses dense 3D point maps for them, learning how 2D image structure maps to 3D shape during training. Because the model predicts geometry directly, it can later recover depth, relative pose, camera parameters, and pixel correspondences from the predicted point maps.
+
+### Why point maps matter
+
+A point map is more informative than a depth map because it gives a 3D location for each pixel, not just distance along one camera ray. That means the representation can naturally support multi-view alignment: if two images observe the same scene point, their predicted 3D points should line up after the correct rigid transform is found. This also lets the system handle scenes with little or no prior calibration, because the geometry is inferred jointly rather than imposed beforehand.
+
+### Multi-view reconstruction
+
+For more than two images, DUSt3R uses an optimization step to globally align the predicted point maps into a shared 3D frame. Once aligned, the model can produce a full scene reconstruction and recover the usual outputs of SfM/MVS pipelines, such as camera poses and dense geometry. In that sense, it behaves like a learned front end plus a geometry alignment back end.
+
+### What is impressive
+
+The paper shows that this one model can do several 3D vision tasks well, including monocular and multi-view depth estimation, relative pose estimation, and reconstruction from arbitrary image collections. Its appeal is not that it replaces all geometry, but that it makes the pipeline much simpler by learning the hardest correspondences and geometric priors directly. That is why the authors describe it as making geometric 3D vision “easy”.
+
+### Plain-English intuition
+
+Think of DUSt3R as a system that looks at photos and says, “I don’t know the camera setup yet, but I can still guess where the visible surfaces are in 3D.”  Then it lines up those guesses across images until everything fits into one consistent scene. Instead of first solving camera calibration and feature matching, it learns a representation where those answers can be recovered afterward.
+
+### Main takeaway
+
+The paper’s big idea is to replace the classical “estimate cameras first, then reconstruct” workflow with a learned dense 3D prediction task. DUSt3R predicts point maps from images, and those point maps are rich enough to recover depth, pose, correspondences, and full 3D structure. In practice, that makes it a unified and surprisingly direct alternative to traditional SfM/MVS pipelines.
 
 ---
 
@@ -99,3 +136,5 @@ The paper’s core idea is surprisingly simple: **replace an explicit 3D model w
 Schonberger, J. L., & Frahm, J.-M. (2016). Structure-from-Motion Revisited. 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 4104–4113. https://doi.org/10.1109/CVPR.2016.445
 
 Mildenhall, B., Srinivasan, P. P., Tancik, M., Barron, J. T., Ramamoorthi, R., & Ng, R. (2020). NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis (arXiv:2003.08934). arXiv. https://doi.org/10.48550/arXiv.2003.08934
+
+Wang, S., Leroy, V., Cabon, Y., Chidlovskii, B., & Revaud, J. (2024). Dust3r: Geometric 3d vision made easy. In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition (pp. 20697-20709). https://doi.org/10.48550/arXiv.2312.14132

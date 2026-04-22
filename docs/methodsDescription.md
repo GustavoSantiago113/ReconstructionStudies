@@ -167,6 +167,37 @@ Think of VGGT as a very strong visual guesser: it looks at all the photos togeth
 
 The main contribution of VGGT is not a new classical geometry algorithm, but a transformer that learns to output the geometric quantities that traditional pipelines labor to recover step by step. In practice, that makes 3D reconstruction simpler, faster, and more unified, while still producing useful camera and scene structure.
 
+---
+
+## Depth Anything 3: Recovering the Visual Space from Any Views
+
+Depth Anything 3 (DA3) is a unified 3D vision model that reconstructs spatially consistent geometry from one image or many views, even when camera poses are unknown. In plain English, it looks at visual inputs and predicts the scene’s 3D layout in a way that stays consistent across viewpoints, rather than treating each image as an isolated depth-estimation problem. 
+
+### What problem it solves
+Older pipelines often split the job into separate tasks like monocular depth, multi-view stereo, camera pose estimation, and rendering. DA3 aims to fold those into a single model that can recover “visual space” from any view configuration, including single images, stereo pairs, multi-view sets, and video. The paper’s main claim is that this can be done with minimal architectural complexity.
+
+### Core idea
+DA3 uses a **single plain transformer** as its backbone, without specialized geometry modules. Instead of predicting many different task-specific outputs, it focuses on a singular **depth-ray** target, which combines depth with ray geometry into one representation. This keeps the model simpler while still encoding enough information to recover 3D structure.
+
+### How it works
+The model takes visual inputs and processes them with a transformer encoder, then uses a DPT-style reassembly and dual-head design to output dense geometry. One output is a depth map, and the other is a dense ray map that encodes the ray origin and direction for each pixel. Together, those outputs describe where each pixel lies in 3D and how to place it consistently across views.
+
+![dav3](images/dav3.png)
+
+### Why the ray target matters
+A plain depth map only tells you distance from the camera, which is useful but incomplete. The ray map adds the camera geometry for each pixel, so the model can reason about the actual 3D line that produced that pixel. That makes it easier to reconstruct consistent geometry from multiple views and to recover camera pose.
+
+### Training strategy
+DA3 uses a teacher-student training setup to reach detail and generalization comparable to Depth Anything 2. The paper says all models are trained using public academic datasets only. This is important because it suggests the gains come from the representation and training design, not from private data scale.
+
+### What it can do
+The model is meant to handle camera pose estimation, any-view geometry, visual rendering, and monocular depth estimation in one framework. The project page says DA3 also achieves strong 3D Gaussian-style reconstruction and “recovers the space” from arbitrary visual inputs. In practical terms, that means you can feed it images from different viewpoints and get geometry that lines up consistently in 3D.
+
+### Plain-English intuition
+Think of DA3 as a very general geometry interpreter: it does not just guess depth for one photo, but tries to infer the 3D visual space behind all the views together. Its trick is to keep the model simple and use a geometry-rich target so the transformer learns both what is in the scene and how the views relate to each other. That is why the paper positions it as a “minimal modeling” approach to visual geometry.
+
+### Main takeaway
+DA3’s main contribution is showing that a single transformer, trained on a depth-ray representation, can recover consistent 3D geometry from arbitrary visual inputs with no special geometric machinery. The result is a simpler and more general 3D vision system that can handle depth, pose, multi-view reconstruction, and rendering in one model.
 
 ---
 
@@ -179,3 +210,6 @@ Mildenhall, B., Srinivasan, P. P., Tancik, M., Barron, J. T., Ramamoorthi, R., &
 Wang, S., Leroy, V., Cabon, Y., Chidlovskii, B., & Revaud, J. (2024). Dust3r: Geometric 3d vision made easy. In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition (pp. 20697-20709). https://doi.org/10.48550/arXiv.2312.14132
 
 Wang, J., Chen, M., Karaev, N., Vedaldi, A., Rupprecht, C., & Novotny, D. (2025). Vggt: Visual geometry grounded transformer. In Proceedings of the Computer Vision and Pattern Recognition Conference (pp. 5294-5306). https://doi.org/10.48550/arXiv.2503.11651
+
+Lin, H., Chen, S., Liew, J., Chen, D. Y., Li, Z., Shi, G., ... & Kang, B. (2025). Depth anything 3: Recovering the visual space from any views. arXiv preprint arXiv:2511.10647. 
+https://doi.org/10.48550/arXiv.2511.10647

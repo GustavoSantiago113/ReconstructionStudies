@@ -62,7 +62,11 @@ See the 360 of the output reconstructions for each method below:
 
 ## Results
 
-Below is the results table regarding processing time and reconstruction quality of each method.
+Below is the results table regarding processing time of each method.
+
+| Method | Images Used | Reconstruction Time |
+| ------ | ------------------- | ----------- |
+
 
 
 ## License & citation

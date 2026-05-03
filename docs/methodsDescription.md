@@ -201,6 +201,35 @@ DA3’s main contribution is showing that a single transformer, trained on a dep
 
 ---
 
+## AliceVision Meshroom: An open-source 3D reconstruction pipeline
+
+AliceVision Meshroom is an open-source, node-based photogrammetry pipeline for reconstructing 3D scenes from images. In plain English, it takes photos of an object or scene and turns them into a sparse 3D point cloud, a denser mesh, and a textured model.
+
+### What the paper is about
+The paper introduces **Meshroom** as the user-facing software and **AliceVision** as the underlying computer vision framework. Its goal is to provide a flexible, open-source reconstruction system that works with images from phones or professional cameras and scales from a few photos to thousands. A key design choice is modularity: the pipeline is built from nodes that can be edited, reused, and extended.
+
+![meshroom](images/meshroom.png)
+
+### Main pipeline
+The default reconstruction pipeline has two big stages: **Structure-from-Motion** and **Multi-View Stereo**. SfM estimates camera poses and builds a sparse point cloud, while MVS densifies the reconstruction by estimating depth maps and producing a fuller surface. After that, the system performs meshing, mesh filtering, and texturing to create the final output.
+
+### How it works
+First, Meshroom initializes cameras and extracts image features. Then it matches those features across image pairs to find correspondences that can be triangulated into 3D points. Once enough images are connected, SfM estimates the camera motion and sparse scene structure; afterward, the MVS stage computes depth maps, filters them, and converts them into a mesh.
+
+### Why the node system matters
+Meshroom is built around a **nodal engine**, meaning each step is a node in a directed acyclic graph. That makes the pipeline easy to customize because users can add, remove, or reorder nodes, rerun only affected parts, and inspect intermediate results. The paper highlights that this design is useful not just for researchers, but also for artists and production workflows.
+
+### Notable implementation details
+AliceVision supports several matching methods, including brute-force, Cascade Hashing, and a KD-tree/FLANN-based approach that is used by default. For dense reconstruction, the system computes depth maps and then fuses them into geometry before texturing the mesh using UV mapping and multi-band blending. The paper also notes that Meshroom can run locally or on render farms and relies on open formats to improve interoperability.
+
+### Plain-English summary
+If COLMAP is a compact research-style SfM system, Meshroom is a more **production-friendly** reconstruction workflow with a visual node editor. You feed in photos, it finds how the cameras moved, estimates the 3D shape, turns that into a surface, and paints the surface with texture from the original images. The big contribution of the paper is showing how to package that into a modular, open-source toolchain that can be customized for many 3D tasks.
+
+### Main takeaway
+Meshroom’s paper is less about inventing a new reconstruction algorithm and more about building a complete, open, extensible 3D reconstruction pipeline around existing photogrammetry ideas. Its strength is the combination of SfM, MVS, meshing, and texturing in a flexible node-based system that is practical for both research and real production work.
+
+---
+
 # References
 
 Schonberger, J. L., & Frahm, J.-M. (2016). Structure-from-Motion Revisited. 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 4104–4113. https://doi.org/10.1109/CVPR.2016.445
@@ -213,3 +242,6 @@ Wang, J., Chen, M., Karaev, N., Vedaldi, A., Rupprecht, C., & Novotny, D. (2025)
 
 Lin, H., Chen, S., Liew, J., Chen, D. Y., Li, Z., Shi, G., ... & Kang, B. (2025). Depth anything 3: Recovering the visual space from any views. arXiv preprint arXiv:2511.10647. 
 https://doi.org/10.48550/arXiv.2511.10647
+
+Carsten Griwodz, Simone Gasparini, Lilian Calvet, Pierre Gurdjos, Fabien Castan, et al.. AliceVision Meshroom: An open-source 3D reconstruction pipeline. 12th ACM Multimedia Systems Conference (MMSys 2021),
+Sep 2021, Istanbul, Turkey. pp.241-247, https://doi.org/10.1145/3458305.3478443.

@@ -1,10 +1,10 @@
-<center>
+<div align="center">
 
 # Reconstruction Studies
 
 **Gustavo Nocera Santiago, 2026**
 
-</center>
+</div>
 
 ---
 
@@ -50,10 +50,6 @@ Run the notebooks to reproduce experiments and view intermediate outputs in [res
 - extract_frames.py — quick frame extraction from video to use the images as methods' inputs.
 - See [notebooks/](notebooks/) for step-by-step experiments and visualization cells.
 
-## Demonstrations
-
-See the 360 of the output reconstructions for each method below:
-
 ## Results
 
 Below is the results table regarding processing time of each method.
@@ -67,6 +63,18 @@ Below is the results table regarding processing time of each method.
 | VGGT | 10 | ~ 2min | No, but makes it faster |
 | DepthAnythingv3 | 10 | ~ 3min | No, but makes it faster |
 | RGBD Turntable | 36 | | No, but makes it faster |
+
+## Demonstrations
+
+See the 360 of the output reconstructions for each method below:
+
+- COLMAP Apple:
+
+<video src="./media/COLMAP_Apple.mp4" controls preload></video>
+
+- COLMAP Miniature:
+
+<video src="./media/COLMAP_Miniature.mp4" controls preload></video>
 
 
 ## License & citation

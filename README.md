@@ -34,21 +34,16 @@ source .venv/bin/activate
 pip install jupyterlab opencv-python numpy
 ```
 
-3. Extract frames from a video (example script included in [utils/](utils/))
-```bash
-python utils/extract_frames.py --video path/to/video.mp4 --outdir data/frames --rate 5
-```
+3. Get the data. 
 
-This saves sampled frames to data/frames (default rate = 5 FPS).
+- Go to https://cseweb.ucsd.edu//~viscomp/projects/LF/papers/ECCV20/nerf/ and download the nerf_example_data.zip
+- Unzip the downloaded file and click on it.
+- Go to `nerf_example_data\nerf_synthetic\lego\`.
+- Copy the files from `train\` and paste into the folder [data/](data/).
 
 4. Open the [notebooks/](notebooks/):
 
-Run the notebooks to reproduce experiments and view intermediate outputs in [results/](results/)
-
-## Examples and demos
-
-- extract_frames.py — quick frame extraction from video to use the images as methods' inputs.
-- See [notebooks/](notebooks/) for step-by-step experiments and visualization cells.
+Run the notebooks to reproduce experiments and view final outputs in [results/](results/)
 
 ## Results
 
@@ -56,7 +51,7 @@ Below is the results table regarding processing time of each method.
 
 | Method | Images Used | Reconstruction Time | Requires GPU? |
 | ------ | ------------------- | ----------- | ------------- |
-| COLMAP | 112 | ~ 1h | For Dense Reconstruction |
+| COLMAP | 100 | 40 min | For Dense Reconstruction |
 | Meshroom | 112 | 23min | For Dense Reconstruction |
 | NeRF | 112 | ~ 9h | Yes |
 | Dust3r | 10 | ~ 1min | No, but makes it faster |
@@ -68,16 +63,13 @@ Below is the results table regarding processing time of each method.
 
 See the 360 of the output reconstructions for each method below:
 
-- COLMAP Apple:
-
-<video src="./media/COLMAP_Apple.mp4" controls preload></video>
-
-- COLMAP Miniature:
-
-<video src="./media/COLMAP_Miniature.mp4" controls preload></video>
+- COLMAP:
 
 
 ## License & citation
 
 - See LICENSE at repo root for repository license.
 - All the models used are from papers presented and cited in `docs/methodsDescription.md`.
+
+## DIY
+

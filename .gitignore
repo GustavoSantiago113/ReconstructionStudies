@@ -4,3 +4,4 @@ data/
 !/results/colmap/mvs/poisson_mesh.ply
 /results/meshroom/*
 !/results/meshroom/reconstruction.ply
+!/results/meshroom/point_cloud.ply

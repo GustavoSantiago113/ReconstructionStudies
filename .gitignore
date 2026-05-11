@@ -2,3 +2,5 @@ data/
 /results/colmap/*
 !/results/colmap/mvs/fused.ply
 !/results/colmap/mvs/poisson_mesh.ply
+/results/meshroom/*
+!/results/meshroom/reconstruction.ply

@@ -282,13 +282,6 @@ def train(images, poses, H, W, focal, testpose, testimg, n_iter, n_samples, i_pl
 
     return model
 
-def encoding(x: torch.Tensor, L: int) -> torch.Tensor:
-    """Positional encoding — must match the one used during training."""
-    freqs = 2.0 ** torch.arange(L, dtype=x.dtype, device=x.device)  # (L,)
-    x_freq = x[..., None] * freqs                                    # (..., 3, L)
-    x_freq = x_freq.reshape(*x.shape[:-1], -1)                       # (..., 3*L)
-    return torch.cat([torch.sin(x_freq), torch.cos(x_freq)], dim=-1) # (..., 6*L)
-
 def render_fn(pts: torch.Tensor, model, device="cuda") -> tuple:
     view_dirs = torch.zeros_like(pts)
     model_input = torch.cat([pts, view_dirs], dim=-1)   # (N, 6)

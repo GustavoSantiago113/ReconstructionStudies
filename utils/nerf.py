@@ -4,10 +4,11 @@ import matplotlib.pyplot as plt
 import torch.nn.init as init
 import time
 import numpy as np
-import os
 from tqdm import tqdm
 import torch.nn.functional as F
 import math
+import skimage.measure as measure
+import trimesh
 
 def encoding(x, L=10):
   res = [x]
@@ -280,3 +281,219 @@ def train(images, poses, H, W, focal, testpose, testimg, n_iter, n_samples, i_pl
             plt.show()
 
     return model
+
+def encoding(x: torch.Tensor, L: int) -> torch.Tensor:
+    """Positional encoding — must match the one used during training."""
+    freqs = 2.0 ** torch.arange(L, dtype=x.dtype, device=x.device)  # (L,)
+    x_freq = x[..., None] * freqs                                    # (..., 3, L)
+    x_freq = x_freq.reshape(*x.shape[:-1], -1)                       # (..., 3*L)
+    return torch.cat([torch.sin(x_freq), torch.cos(x_freq)], dim=-1) # (..., 6*L)
+
+def render_fn(pts: torch.Tensor, model, device="cuda") -> tuple:
+    view_dirs = torch.zeros_like(pts)
+    model_input = torch.cat([pts, view_dirs], dim=-1)   # (N, 6)
+    with torch.no_grad():
+        raw = model(model_input)                         # (N, 4)
+    return raw[..., 1:], raw[..., 0]                    # rgb (N,3), sigma (N,)
+
+def extract_mesh(
+    model,
+    bound: float = 4.0,
+    resolution: int = 256,
+    density_threshold: float = 10.0,
+    chunk: int = 32768,
+    device: str = "cuda",
+) -> tuple:
+    model.eval()
+    lin = torch.linspace(-bound, bound, resolution, device=device)
+    gx, gy, gz = torch.meshgrid(lin, lin, lin, indexing="ij")
+    pts = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)
+
+    sigmas = []
+    for i in range(0, len(pts), chunk):
+        _, sigma = render_fn(pts[i : i + chunk], model, device)
+        sigmas.append(sigma.cpu())
+
+    sigma_vol = torch.cat(sigmas).numpy().reshape(resolution, resolution, resolution)
+
+    print(f"Density  min={sigma_vol.min():.3f}  max={sigma_vol.max():.3f}  "
+          f"mean={sigma_vol.mean():.3f}  — adjust density_threshold accordingly")
+
+    verts, faces, _, _ = measure.marching_cubes(sigma_vol, level=density_threshold)
+
+    # voxel coords → world coords
+    verts = verts / (resolution - 1) * (2 * bound) - bound
+    return verts, faces
+
+
+def color_mesh(
+    verts: np.ndarray,
+    train_poses: np.ndarray,
+    model,
+    chunk: int = 4096,
+    device: str = "cuda",
+) -> np.ndarray:
+    """
+    For each vertex, query the NeRF model from every training camera direction
+    and average the resulting RGB values.
+    """
+    model.eval()
+    verts_t = torch.tensor(verts, dtype=torch.float32, device=device)  # (V, 3)
+    
+    color_accum  = np.zeros((len(verts), 3), np.float64)
+    weight_accum = np.zeros(len(verts),      np.float64)
+
+    for c2w in train_poses:
+        cam_pos = c2w[:3, 3]                                    # (3,) world-space camera center
+        cam_pos_t = torch.tensor(cam_pos, dtype=torch.float32, device=device)
+
+        # Unit view direction: from vertex toward camera
+        dirs = cam_pos_t.unsqueeze(0) - verts_t                 # (V, 3)
+        dirs = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-8)  # (V, 3) normalized
+
+        rgb_accum_view = []
+        sig_accum_view = []
+
+        for i in range(0, len(verts), chunk):
+            pts_chunk  = verts_t[i : i + chunk]     # (C, 3)
+            dirs_chunk = dirs[i : i + chunk]         # (C, 3)
+
+            model_input = torch.cat([pts_chunk, dirs_chunk], dim=-1)  # (C, 6)
+            with torch.no_grad():
+                raw = model(model_input)             # (C, 4): [sigma, r, g, b]
+
+            sig_accum_view.append(raw[..., 0].cpu())
+            rgb_accum_view.append(raw[..., 1:].cpu())
+
+        sigmas = torch.cat(sig_accum_view).numpy()  # (V,)
+        rgbs   = torch.cat(rgb_accum_view).numpy()  # (V, 3)
+
+        # Weight by sigma (confident surface points get more influence)
+        # and by camera distance (closer = more reliable)
+        dist = np.linalg.norm(verts - cam_pos, axis=1)
+        w    = sigmas / (dist + 1e-4)
+
+        color_accum  += rgbs * w[:, None]
+        weight_accum += w
+
+    colors = np.full((len(verts), 3), 0.5, np.float32)
+    seen   = weight_accum > 0
+    colors[seen] = (color_accum[seen] / weight_accum[seen, None]).astype(np.float32)
+    return colors
+
+
+def save_mesh(verts, faces, colors, path="nerf_mesh.glb"):
+    mesh = trimesh.Trimesh(
+        vertices=verts,
+        faces=faces,
+        vertex_colors=(colors * 255).clip(0, 255).astype(np.uint8),
+        process=False,
+    )
+    mesh.export(path)
+    print(f"Saved → {path}  ({len(verts):,} verts, {len(faces):,} faces)")
+    return mesh
+
+def extract_point_cloud(
+    model,
+    bound: float = 4.0,
+    resolution: int = 256,
+    density_threshold: float = 10.0,
+    chunk: int = 32768,
+    device: str = "cuda",
+) -> tuple:
+    """
+    Returns xyz (N, 3) and raw sigmas (N,) for all voxels above threshold.
+    """
+    model.eval()
+    lin = torch.linspace(-bound, bound, resolution, device=device)
+    gx, gy, gz = torch.meshgrid(lin, lin, lin, indexing="ij")
+    pts = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)  # (R^3, 3)
+
+    sigmas = []
+    for i in range(0, len(pts), chunk):
+        view_dirs   = torch.zeros_like(pts[i : i + chunk])
+        model_input = torch.cat([pts[i : i + chunk], view_dirs], dim=-1)
+        with torch.no_grad():
+            raw = model(model_input)
+        sigmas.append(raw[..., 0].cpu())
+
+    sigmas = torch.cat(sigmas).numpy()           # (R^3,)
+    pts_np = pts.cpu().numpy()                   # (R^3, 3)
+
+    mask   = sigmas > density_threshold
+    print(f"Points above threshold: {mask.sum():,} / {len(mask):,}")
+
+    return pts_np[mask], sigmas[mask]
+
+def color_point_cloud(
+    xyz: np.ndarray,             # (N, 3)
+    sigmas: np.ndarray,          # (N,)
+    train_poses: np.ndarray,     # (N_cams, 4, 4)
+    model,
+    chunk: int = 4096,
+    black_threshold: float = 0.15,   # drop points darker than this (0–1)
+    device: str = "cuda",
+) -> tuple:
+    """
+    Color each point by querying the NeRF from its nearest training camera.
+    Returns filtered (xyz, colors) with black points removed.
+    """
+    model.eval()
+    xyz_t = torch.tensor(xyz, dtype=torch.float32, device=device)
+
+    cam_centers = train_poses[:, :3, 3]                    # (N_cams, 3)
+
+    color_accum  = np.zeros((len(xyz), 3), np.float64)
+    weight_accum = np.zeros(len(xyz),      np.float64)
+
+    for c2w in train_poses:
+        cam_pos   = c2w[:3, 3]
+        cam_pos_t = torch.tensor(cam_pos, dtype=torch.float32, device=device)
+
+        dirs   = cam_pos_t.unsqueeze(0) - xyz_t
+        dirs   = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-8)
+
+        rgbs_view = []
+        for i in range(0, len(xyz), chunk):
+            model_input = torch.cat([xyz_t[i:i+chunk], dirs[i:i+chunk]], dim=-1)
+            with torch.no_grad():
+                raw = model(model_input)
+            rgbs_view.append(raw[..., 1:].cpu())
+
+        rgbs = torch.cat(rgbs_view).numpy()   # (N, 3) — already sigmoid'd
+
+        dist = np.linalg.norm(xyz - cam_pos, axis=1)
+        w    = (sigmas ** 2) / (dist + 1e-4)
+
+        color_accum  += rgbs * w[:, None]
+        weight_accum += w
+
+    colors = np.full((len(xyz), 3), 0.5, np.float32)
+    seen   = weight_accum > 0
+    colors[seen] = (color_accum[seen] / weight_accum[seen, None]).astype(np.float32)
+
+    # ── Remove black points ───────────────────────────────────────────────────
+    # A point is "black" if its perceived brightness is below the threshold.
+    # Using perceived luminance weights (matches human vision better than mean).
+    luminance = (0.2126 * colors[:, 0] +
+                 0.7152 * colors[:, 1] +
+                 0.0722 * colors[:, 2])
+
+    bright_mask = luminance > black_threshold
+    removed = (~bright_mask).sum()
+    print(f"Removed {removed:,} black points ({100*removed/len(xyz):.1f}%)")
+
+    return xyz[bright_mask], colors[bright_mask]
+
+def save_point_cloud(
+    xyz: np.ndarray,
+    colors: np.ndarray,
+    path: str = "nerf_pointcloud.ply",
+):
+    cloud = trimesh.PointCloud(
+        vertices=xyz,
+        colors=(colors * 255).clip(0, 255).astype(np.uint8),
+    )
+    cloud.export(path)
+    print(f"Saved → {path}  ({len(xyz):,} points)")
+    return cloud

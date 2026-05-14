@@ -52,8 +52,8 @@ Below is the results table regarding processing time of each method.
 | Method | Images Used | Reconstruction Time | Requires GPU? |
 | ------ | ------------------- | ----------- | ------------- |
 | COLMAP | 100 | 40 min | For Dense Reconstruction |
-| Meshroom | 112 | 10min | For Dense Reconstruction |
-| NeRF | 112 | ~ 9h | Yes |
+| Meshroom | 100 | 10min | For Dense Reconstruction |
+| NeRF | 100 | 3:38 h | Yes |
 | Dust3r | 10 | ~ 1min | No, but makes it faster |
 | VGGT | 10 | ~ 2min | No, but makes it faster |
 | DepthAnythingv3 | 10 | ~ 3min | No, but makes it faster |

@@ -228,35 +228,6 @@ If COLMAP is a compact research-style SfM system, Meshroom is a more **productio
 ### Main takeaway
 Meshroom’s paper is less about inventing a new reconstruction algorithm and more about building a complete, open, extensible 3D reconstruction pipeline around existing photogrammetry ideas. Its strength is the combination of SfM, MVS, meshing, and texturing in a flexible node-based system that is practical for both research and real production work.
 
----
-
-## RGB-D Mapping: Using Depth Cameras for Dense 3D Modeling of Indoor Environments
-
-**RGB-D Mapping** is a dense indoor 3D reconstruction system that combines color images with per-pixel depth to build globally consistent maps in real time. In plain English, it uses a depth camera like a Kinect to “see” both what the room looks like and how far away every visible surface is, then stitches many frames together into one 3D model.
-
-### What the paper solves
-The paper focuses on indoor environments, where pure vision methods can struggle in dark, textureless, or repetitive areas. Its main goal is to produce dense 3D models, not just sparse camera tracks or point clouds, so the result is useful for navigation, manipulation, semantic mapping, and telepresence. The key challenge is that low-cost RGB-D sensors are noisy and limited in range, so the system must combine multiple sources of information robustly.
-
-### Main idea
-The central idea is to fuse **appearance** from RGB images with **shape** from depth maps during alignment and mapping. Instead of relying only on visual feature matching, the system uses a joint optimization scheme that estimates how each new frame aligns to the current model while exploiting both color and geometry. This makes it more stable than using either RGB or depth alone. 
-
-### How it works
-The pipeline starts by registering incoming RGB-D frames to the existing map using an enhanced ICP method called RGBD-ICP. RGBD-ICP combines SIFT-style visual features with dense depth alignment, so the algorithm can match frames even when one modality is weak. After alignment, the new frame is fused into the dense model, and the surfel-based surface representation is updated for visualization and occlusion handling.
-
-![rgbd](./images/rgbd.png)
-
-### Loop closure and consistency
-Like SLAM systems, RGB-D Mapping detects when the camera revisits a previously seen place. It does this by comparing current frames against a subset of earlier frames using both visual and depth information. Once a loop closure is found, the system uses pose-graph optimization to make the whole trajectory globally consistent and reduce drift.
-
-### Why this matters
-A lot of early mapping systems could either be dense but fragile, or robust but sparse. RGB-D Mapping shows that cheap depth cameras can produce dense, useful 3D indoor maps if you jointly optimize color and geometry rather than treating them separately. The paper reports that this approach works well even in difficult places like featureless corridors and dark rooms.
-
-### Plain-English intuition
-Imagine walking through a room with a camera that tells you both the photo and the distance to each visible surface. Each new frame is lined up against the growing model using both what things look like and where they sit in 3D space. As the camera moves, the system keeps adding these aligned pieces together until a full indoor model emerges.
-
-### Main takeaway
-The paper’s big contribution is showing that low-cost RGB-D cameras can support dense, globally consistent indoor 3D mapping when appearance and depth are tightly fused. In practical terms, it is an early and influential bridge between SLAM and dense reconstruction, with a pipeline that is designed to work in real indoor environments rather than ideal lab scenes.
-
 
 ---
 
@@ -275,5 +246,3 @@ https://doi.org/10.48550/arXiv.2511.10647
 
 Carsten Griwodz, Simone Gasparini, Lilian Calvet, Pierre Gurdjos, Fabien Castan, et al.. AliceVision Meshroom: An open-source 3D reconstruction pipeline. 12th ACM Multimedia Systems Conference (MMSys 2021),
 Sep 2021, Istanbul, Turkey. pp.241-247, https://doi.org/10.1145/3458305.3478443.
-
-Henry, P., Krainin, M., Herbst, E., Ren, X., & Fox, D. (2012). RGB-D mapping: Using Kinect-style depth cameras for dense 3D modeling of indoor environments. The international journal of Robotics Research, 31(5), 647-663.

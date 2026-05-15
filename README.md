@@ -57,7 +57,6 @@ Below is the results table regarding processing time of each method.
 | Dust3r | 10 | ~ 1min | No, but makes it faster |
 | VGGT | 10 | ~ 2min | No, but makes it faster |
 | DepthAnythingv3 | 10 | ~ 3min | No, but makes it faster |
-| RGBD Turntable | 36 | | No, but makes it faster |
 
 ## Demonstrations
 

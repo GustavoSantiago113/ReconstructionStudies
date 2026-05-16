@@ -2,15 +2,30 @@
 
 # Reconstruction Studies
 
-**Gustavo Nocera Santiago, 2026**
-
 </div>
 
 ---
 
-A compact workspace for experiments in 3D reconstruction. This repo collects utilities, example notebooks, data and model artifacts used for reconstruction experiments.
+- [Reconstruction Studies](#reconstruction-studies)
+- [Contents](#contents)
+- [Quick start - Reproducing the Results](#quick-start---reproducing-the-results)
+- [Results](#results)
+- [Reconstruction Visualization](#reconstruction-visualization)
+- [License \& citation](#license--citation)
+- [DIY](#diy)
 
-## Contents
+---
+
+A compact workspace for to learn 3D reconstruction. This repo collects utilities, example notebooks, data and model artifacts used for reconstruction experiments. It comprises the 3D reconstruction pipelines:
+
+- COLMAP
+- DepthAntythingv3
+- dust3r
+- Meshroom
+- NeRF
+- VGGT
+
+# Contents
 
 - `notebooks` — Jupyter notebooks with experiments and pipelines  
 - `utils` — helper scripts (frame extraction, nerf models, image selector, meshing tools, camera calibration).  
@@ -18,7 +33,7 @@ A compact workspace for experiments in 3D reconstruction. This repo collects uti
 - `results` — output reconstructions, point clouds and visualizations.
 - `docs` - studying notes regarding each reconstruction method tested here.
 
-## Quick start
+# Quick start - Reproducing the Results
 
 1. Create a Python environment:
 ```bash
@@ -30,6 +45,7 @@ source .venv/bin/activate
 ```
 
 2. Install dependencies (project-wide or per-script as needed). Example (install common tools):
+
 ```bash
 pip install jupyterlab opencv-python numpy
 ```
@@ -45,7 +61,7 @@ pip install jupyterlab opencv-python numpy
 
 Run the notebooks to reproduce experiments and view final outputs in [results/](results/)
 
-## Results
+# Results
 
 Below is the results table regarding processing time of each method.
 
@@ -58,17 +74,45 @@ Below is the results table regarding processing time of each method.
 | VGGT | 10 | ~ 2min | No, but makes it faster |
 | DepthAnythingv3 | 10 | ~ 3min | No, but makes it faster |
 
-## Demonstrations
+# Reconstruction Visualization
 
-See the 360 of the output reconstructions for each method below:
+See the 360 view video of the output reconstructions for each method below:
 
-- COLMAP:
+- [COLMAP](results/colmap_results/fused.ply):
 
 
-## License & citation
+<video src="media/colmap.mp4" width="320" height="240" controls></video>
+
+- [Meshroom](results/meshroom/point_cloud.ply):
+
+<video src="media/meshroom.mp4" width="320" height="240" controls></video>
+
+- [NeRF](results/nerf/nerf_pointcloud.ply):
+
+<video src="media/nerf.mp4" width="320" height="240" controls></video>
+
+- [Dust3r](results/dust3r/reconstruction.ply):
+
+<video src="media/dust3r.mp4" width="320" height="240" controls></video>
+
+- [VGGT](results/vggt/Reconstruction.ply):
+
+<video src="media/vggt.mp4" width="320" height="240" controls></video>
+
+- [Depth Anything v3](results/da3/Reconstruction.ply):
+
+<video src="media/da3.mp4" width="320" height="240" controls></video>
+
+
+# License & citation
 
 - See LICENSE at repo root for repository license.
-- All the models used are from papers presented and cited in `docs/methodsDescription.md`.
+- All the pipelines, models and methods used has a more detailed explanation presented and the papers that originated them cited in [methodsDescription.md](docs/methodsDescription.md).
 
-## DIY
+# DIY
 
+1. Get multiple view images from an object or scene.
+   1. You can record a video and use [extract_frames.py](utils/extract_frames.py) script to extract the frames.
+2. Save the data in `data/` folder.
+3. Use the scripts from the `notebooks/` again to generate the 3D reconstructions.
+4. Generate the 360 view video from the reconstruction using the script [visualization_video.py](utils/visualization_video.py)

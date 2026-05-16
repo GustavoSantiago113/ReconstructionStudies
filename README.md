@@ -47,7 +47,7 @@ source .venv/bin/activate
 2. Install dependencies (project-wide or per-script as needed). Example (install common tools):
 
 ```bash
-pip install jupyterlab opencv-python numpy
+pip install requirements.txt
 ```
 
 3. Get the data. 

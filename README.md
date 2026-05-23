@@ -1,12 +1,12 @@
 <div align="center">
 
-# Reconstruction Studies
+# 3D Reconstruction Studies
 
 </div>
 
 ---
 
-- [Reconstruction Studies](#reconstruction-studies)
+- [3D Reconstruction Studies](#3d-reconstruction-studies)
 - [Contents](#contents)
 - [Quick start - Reproducing the Results](#quick-start---reproducing-the-results)
 - [Results](#results)

@@ -78,30 +78,17 @@ Below is the results table regarding processing time of each method.
 
 See the 360 view video of the output reconstructions for each method below:
 
-- [COLMAP](results/colmap_results/fused.ply):
+- [COLMAP](results/colmap_results/fused.ply): [video]("media/colmap.mp4")
 
+- [Meshroom](results/meshroom/point_cloud.ply): [video]("media/meshroom.mp4")
 
-<video src="./media/colmap.mp4" width="320" height="240" controls></video>
+- [NeRF](results/nerf/nerf_pointcloud.ply): [video]("media/nerf.mp4")
 
-- [Meshroom](results/meshroom/point_cloud.ply):
+- [Dust3r](results/dust3r/reconstruction.ply): [video]("media/dust3r.mp4")
 
-<video src="./media/meshroom.mp4" width="320" height="240" controls></video>
+- [VGGT](results/vggt/Reconstruction.ply): [video]("media/vggt.mp4")
 
-- [NeRF](results/nerf/nerf_pointcloud.ply):
-
-<video src="./media/nerf.mp4" width="320" height="240" controls></video>
-
-- [Dust3r](results/dust3r/reconstruction.ply):
-
-<video src="./media/dust3r.mp4" width="320" height="240" controls></video>
-
-- [VGGT](results/vggt/Reconstruction.ply):
-
-<video src="./media/vggt.mp4" width="320" height="240" controls></video>
-
-- [Depth Anything v3](results/da3/Reconstruction.ply):
-
-<video src="./media/da3.mp4" width="320" height="240" controls></video>
+- [Depth Anything v3](results/da3/Reconstruction.ply): [video]("media/da3.mp4")
 
 
 # License & citation

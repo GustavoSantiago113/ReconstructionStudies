@@ -78,17 +78,17 @@ Below is the results table regarding processing time of each method.
 
 See the 360 view video of the output reconstructions for each method below:
 
-- [COLMAP](results/colmap_results/fused.ply): [video]("media/colmap.mp4")
+- [COLMAP](results/colmap_results/fused.ply): [video](media/colmap.mp4)
 
-- [Meshroom](results/meshroom/point_cloud.ply): [video]("media/meshroom.mp4")
+- [Meshroom](results/meshroom/point_cloud.ply): [video](media/meshroom.mp4)
 
-- [NeRF](results/nerf/nerf_pointcloud.ply): [video]("media/nerf.mp4")
+- [NeRF](results/nerf/nerf_pointcloud.ply): [video](media/nerf.mp4)
 
-- [Dust3r](results/dust3r/reconstruction.ply): [video]("media/dust3r.mp4")
+- [Dust3r](results/dust3r/reconstruction.ply): [video](media/dust3r.mp4)
 
-- [VGGT](results/vggt/Reconstruction.ply): [video]("media/vggt.mp4")
+- [VGGT](results/vggt/Reconstruction.ply): [video](media/vggt.mp4)
 
-- [Depth Anything v3](results/da3/Reconstruction.ply): [video]("media/da3.mp4")
+- [Depth Anything v3](results/da3/Reconstruction.ply): [video](media/da3.mp4)
 
 
 # License & citation

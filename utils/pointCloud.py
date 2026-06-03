@@ -116,3 +116,6 @@ def remove_outliers(pc, eps=0.02, min_points=10):
     mask_cluster = labels == largest_cluster
     cleaned_pc = pc.select_by_index(np.where(mask_cluster)[0])
     return cleaned_pc
+
+if __name__ == "__main__":
+    visualize_point_cloud('results/meshroom/reconstruction.ply')
